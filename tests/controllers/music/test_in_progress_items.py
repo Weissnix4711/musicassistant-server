@@ -1,0 +1,232 @@
+"""Tests for MusicController.in_progress_items playlog queries."""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import pytest
+from music_assistant_models.auth import User, UserRole
+from music_assistant_models.config_entries import ProviderAccess
+from music_assistant_models.enums import MediaType, ProviderSharing
+
+from music_assistant.constants import DB_TABLE_MEDIA_PROGRESS, DB_TABLE_PROVIDER_MAPPINGS
+from music_assistant.helpers.datetime import utc_timestamp
+from music_assistant.mass import MusicAssistant
+from tests.common import set_music_source_access
+
+GET_CURRENT_USER = "music_assistant.controllers.music.controller.get_current_user"
+
+
+@pytest.fixture(name="mass")
+def mass_fixture(music_mass: MusicAssistant) -> MusicAssistant:
+    """Run on a library-only instance: these tests only touch the library."""
+    return music_mass
+
+
+async def _add_in_progress_row(
+    mass: MusicAssistant,
+    item_id: str,
+    *,
+    provider: str = "library",
+    media_type: MediaType = MediaType.AUDIOBOOK,
+    userid: str = "user-a",
+    days_ago: int = 0,
+    podcast_item_id: str | None = None,
+) -> None:
+    """Insert a single in-progress (partially played) playlog row."""
+    await mass.music.database.insert(
+        DB_TABLE_MEDIA_PROGRESS,
+        {
+            "item_id": item_id,
+            "provider": provider,
+            "media_type": media_type.value,
+            "name": f"Item {item_id}",
+            "timestamp": int(utc_timestamp()) - days_ago * 86400,
+            "fully_played": False,
+            "seconds_played": 60,
+            "userid": userid,
+            "user_initiated": True,
+            "podcast_item_id": podcast_item_id,
+        },
+    )
+
+
+async def _add_provider_mapping(
+    mass: MusicAssistant,
+    item_id: int,
+    provider_instance: str,
+    media_type: MediaType = MediaType.AUDIOBOOK,
+    *,
+    available: bool = True,
+    in_library: bool = True,
+) -> None:
+    """Insert a provider mapping row for a library item."""
+    await mass.music.database.insert(
+        DB_TABLE_PROVIDER_MAPPINGS,
+        {
+            "media_type": media_type.value,
+            "item_id": item_id,
+            "provider_domain": provider_instance.rstrip("0123456789_"),
+            "provider_instance": provider_instance,
+            "provider_item_id": f"{provider_instance}-{item_id}",
+            "available": available,
+            "in_library": in_library,
+        },
+    )
+
+
+@pytest.mark.parametrize("in_library", [True, False])
+async def test_in_progress_items_shows_library_audiobook_only_while_in_library(
+    mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch, in_library: bool
+) -> None:
+    """A library audiobook whose row only holds a dislike is not in progress."""
+    monkeypatch.setattr(mass.music, "get_active_provider_instances", lambda: ["local_1"])
+    await _add_provider_mapping(mass, item_id=1, provider_instance="local_1", in_library=in_library)
+    await _add_in_progress_row(mass, "1", provider="library")
+
+    result = await mass.music.in_progress_items(limit=10)
+
+    assert ({item.item_id for item in result} == {"1"}) is in_library
+
+
+async def test_in_progress_items_omitted_providers_unchanged(
+    mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Existing callers (no providers filter) keep seeing every in-progress entry."""
+    monkeypatch.setattr(mass.music, "get_active_provider_instances", lambda: ["local_1"])
+    await _add_provider_mapping(mass, item_id=1, provider_instance="local_1")
+    await _add_in_progress_row(mass, "1", provider="library")
+
+    result = await mass.music.in_progress_items(limit=10)
+
+    assert {item.item_id for item in result} == {"1"}
+
+
+async def test_in_progress_items_filters_direct_provider_entries(
+    mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Direct (non-library) playlog entries are matched against their own provider."""
+    monkeypatch.setattr(
+        mass.music, "get_active_provider_instances", lambda: ["audible_1", "local_1"]
+    )
+    await _add_in_progress_row(mass, "audible-book", provider="audible_1")
+    await _add_in_progress_row(mass, "local-book", provider="local_1")
+
+    result = await mass.music.in_progress_items(limit=10, providers=["local_1"])
+
+    assert {item.item_id for item in result} == {"local-book"}
+
+
+async def test_in_progress_items_library_item_or_matches_any_mapping(
+    mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A library item mapped to two providers remains when only one is requested."""
+    monkeypatch.setattr(
+        mass.music, "get_active_provider_instances", lambda: ["audible_1", "local_1"]
+    )
+    await _add_provider_mapping(mass, item_id=1, provider_instance="audible_1")
+    await _add_provider_mapping(mass, item_id=1, provider_instance="local_1")
+    await _add_in_progress_row(mass, "1", provider="library")
+
+    result = await mass.music.in_progress_items(limit=10, providers=["local_1"])
+
+    assert {item.item_id for item in result} == {"1"}
+
+
+async def test_in_progress_items_explicit_empty_providers_returns_no_items(
+    mass: MusicAssistant,
+) -> None:
+    """An explicit empty provider list returns no items, distinct from omitting the filter."""
+    await _add_in_progress_row(mass, "book-1")
+
+    result = await mass.music.in_progress_items(limit=10, providers=[])
+
+    assert result == []
+
+
+async def test_in_progress_items_combines_explicit_and_user_music_sources(
+    mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user's music sources narrow an explicit filter that would otherwise pass."""
+    monkeypatch.setattr(
+        mass.music, "get_active_provider_instances", lambda: ["audible_1", "local_1"]
+    )
+    # audible_1 is another member's private source, so user-a may not use it
+    set_music_source_access(
+        mass,
+        {
+            "local_1": ProviderAccess(owner="user-a", sharing=ProviderSharing.PRIVATE),
+            "audible_1": ProviderAccess(owner="user-b", sharing=ProviderSharing.PRIVATE),
+        },
+    )
+    user_a = User(user_id="user-a", username="user-a", role=UserRole.USER)
+    await _add_provider_mapping(mass, item_id=1, provider_instance="audible_1")
+    await _add_provider_mapping(mass, item_id=1, provider_instance="local_1")
+    await _add_in_progress_row(mass, "1", provider="library")
+
+    with patch(GET_CURRENT_USER, return_value=user_a):
+        result = await mass.music.in_progress_items(limit=10, providers=["local_1"])
+    assert {item.item_id for item in result} == {"1"}
+
+    # requesting a music source the user may not use must not leak the item back
+    # in, even though the item does have a (restricted) mapping to it.
+    with patch(GET_CURRENT_USER, return_value=user_a):
+        result = await mass.music.in_progress_items(limit=10, providers=["audible_1"])
+    assert result == []
+
+
+@pytest.mark.parametrize(
+    ("podcast_item_id", "podcast_in_library", "days_ago", "shown"),
+    [
+        ("podcastfeed_1-1", True, 30, True),
+        # a library row that only holds a dislike
+        ("podcastfeed_1-1", False, 30, False),
+        ("podcast-elsewhere", True, 30, False),
+        ("podcast-elsewhere", True, 1, True),
+    ],
+)
+async def test_in_progress_items_keeps_older_episodes_of_library_podcasts(
+    mass: MusicAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    podcast_item_id: str,
+    podcast_in_library: bool,
+    days_ago: int,
+    shown: bool,
+) -> None:
+    """An episode older than a week only shows while its podcast is in the library."""
+    monkeypatch.setattr(mass.music, "get_active_provider_instances", lambda: ["podcastfeed_1"])
+    await _add_provider_mapping(
+        mass,
+        item_id=1,
+        provider_instance="podcastfeed_1",
+        media_type=MediaType.PODCAST,
+        in_library=podcast_in_library,
+    )
+    await _add_in_progress_row(
+        mass,
+        "episode-1",
+        provider="podcastfeed_1",
+        media_type=MediaType.PODCAST_EPISODE,
+        days_ago=days_ago,
+        podcast_item_id=podcast_item_id,
+    )
+
+    result = await mass.music.in_progress_items(limit=10)
+
+    assert ([item.item_id for item in result] == ["episode-1"]) is shown
+
+
+async def test_in_progress_items_excludes_unavailable_mapping(
+    mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mapping that is no longer available on the requested provider cannot match."""
+    monkeypatch.setattr(
+        mass.music, "get_active_provider_instances", lambda: ["local_1", "audible_1"]
+    )
+    await _add_provider_mapping(mass, item_id=1, provider_instance="local_1")
+    await _add_provider_mapping(mass, item_id=1, provider_instance="audible_1", available=False)
+    await _add_in_progress_row(mass, "1", provider="library")
+
+    result = await mass.music.in_progress_items(limit=10, providers=["audible_1"])
+
+    assert result == []

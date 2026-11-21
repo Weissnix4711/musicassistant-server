@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.background_task import TaskSchedule
-from music_assistant_models.config_entries import ConfigEntry
+from music_assistant_models.config_entries import ConfigActionResult, ConfigEntry
 from music_assistant_models.enums import ConfigEntryType
 
 from music_assistant.constants import (
@@ -34,7 +35,13 @@ from music_assistant.controllers.tasks.context import (
 )
 from music_assistant.helpers.database import DatabaseConnection
 from music_assistant.helpers.datetime import local_clock_time_to_utc
-from music_assistant.helpers.json import SerializableType, async_json_loads, json_dumps
+from music_assistant.helpers.json import (
+    JSON_DECODE_EXCEPTIONS,
+    SerializableType,
+    async_json_loads,
+    json_dumps,
+    json_loads,
+)
 from music_assistant.models.core_controller import CoreController
 
 if TYPE_CHECKING:
@@ -67,18 +74,13 @@ class CacheController(CoreController):
             ),
         )
 
-    async def handle_config_action(self, action: str) -> tuple[ConfigEntry, ...]:
-        """Handle a one-shot action button press and re-render the config entries."""
+    async def handle_config_action(
+        self, action: str
+    ) -> tuple[ConfigEntry, ...] | ConfigActionResult | None:
+        """Handle a one-shot action button press and report its outcome."""
         if action == CONF_CLEAR_CACHE:
             await self.clear()
-            return (
-                *await self.get_config_entries(),
-                # distinct key so the result label doesn't collide with the action's label
-                ConfigEntry(
-                    key="clear_cache_result",
-                    type=ConfigEntryType.LABEL,
-                ),
-            )
+            return ConfigActionResult(translation_key=f"{CONF_CLEAR_CACHE}.result")
         return await super().handle_config_action(action)
 
     async def setup(self, config: CoreConfig) -> None:
@@ -195,7 +197,7 @@ class CacheController(CoreController):
                 return None, False, False
             try:
                 data = await async_json_loads(db_row["data"])
-            except Exception as exc:
+            except JSON_DECODE_EXCEPTIONS as exc:
                 LOGGER.error(
                     "Error parsing cache data for %s/%s/%s: %s",
                     provider,
@@ -211,6 +213,46 @@ class CacheController(CoreController):
                     return base_class.from_dict(data), is_fresh, True
                 return data, is_fresh, True
         return None, False, False
+
+    async def get_all(
+        self,
+        provider: str = "default",
+        category: int = 0,
+        base_class: Any = None,
+    ) -> dict[str, Any]:
+        """
+        Return every non-expired cache entry for a provider/category as a key -> data mapping.
+
+        Use this instead of many individual :meth:`get` calls when a caller needs to check a
+        large number of keys against the cache at once (e.g. while scanning a whole library),
+        since it issues a single query and a single deserialization batch rather than one of
+        each per key.
+
+        :param provider: Provider id to group cache objects.
+        :param category: Category to group cache objects.
+        :param base_class: If provided, reconstruct each entry using base_class.from_dict().
+        """
+        assert self.database is not None
+        cur_time = int(time.time())
+        rows = await self.database.get_rows_from_query(
+            f"SELECT key, data FROM {DB_TABLE_CACHE} "
+            "WHERE category = :category AND provider = :provider AND expires >= :cur_time",
+            {"category": category, "provider": provider, "cur_time": cur_time},
+            limit=0,
+        )
+        # deserialize every row in one thread-pool submission instead of one per row, which
+        # otherwise means thousands of thread submissions/context switches on a large result
+        result = await asyncio.to_thread(self._deserialize_rows, rows, provider, category)
+        if base_class is not None:
+            for key, data in result.items():
+                if data is None:
+                    continue
+                result[key] = (
+                    [base_class.from_dict(item) for item in data]
+                    if isinstance(data, list)
+                    else base_class.from_dict(data)
+                )
+        return result
 
     async def get_expiration(
         self,
@@ -306,6 +348,28 @@ class CacheController(CoreController):
             match["provider"] = provider
         await self.database.delete(DB_TABLE_CACHE, match)
 
+    async def delete_prefix(self, prefix: str, provider: str, category: int = 0) -> None:
+        """
+        Delete the cache entries of a provider whose key starts with the given prefix.
+
+        :param prefix: The start of the keys to delete.
+        :param provider: Provider id the entries are grouped by.
+        :param category: Category the entries are grouped by.
+        """
+        assert self.database is not None
+        assert prefix, "No prefix provided"
+        # a key range rather than LIKE keeps the delete on the (category, key, provider) index
+        await self.database.execute_write(
+            f"DELETE FROM {DB_TABLE_CACHE} WHERE category = :category AND provider = :provider "
+            "AND key >= :prefix AND key < :end",
+            {
+                "category": category,
+                "provider": provider,
+                "prefix": prefix,
+                "end": prefix[:-1] + chr(ord(prefix[-1]) + 1),
+            },
+        )
+
     async def clear(
         self,
         key_filter: str | None = None,
@@ -369,6 +433,31 @@ class CacheController(CoreController):
                 MAX_CACHE_DB_SIZE_MB,
             )
 
+    def _deserialize_rows(
+        self, rows: list[Mapping[str, Any]], provider: str, category: int
+    ) -> dict[str, Any]:
+        """
+        JSON-deserialize a batch of raw cache rows synchronously, skipping unparsable ones.
+
+        :param rows: Raw ``key``/``data`` rows selected from the cache table.
+        :param provider: Provider id the rows were selected for, used only for error logging.
+        :param category: Category the rows were selected for, used only for error logging.
+        """
+        result: dict[str, Any] = {}
+        for row in rows:
+            try:
+                result[row["key"]] = json_loads(row["data"])
+            except ValueError as exc:
+                LOGGER.error(
+                    "Error parsing cache data for %s/%s/%s: %s",
+                    provider,
+                    category,
+                    row["key"],
+                    str(exc),
+                    exc_info=exc if self.logger.isEnabledFor(10) else None,
+                )
+        return result
+
     async def _get_cache_db_size_mb(self) -> float:
         """Return the on-disk size of the cache database (in MB)."""
         db_path = os.path.join(self.mass.cache_path, "cache.db")
@@ -378,7 +467,7 @@ class CacheController(CoreController):
         def _get_db_size() -> float:
             total = 0
             for path in db_files:
-                if os.path.exists(path):
+                if Path(path).exists():
                     total += Path(path).stat().st_size
             return total / (1024 * 1024)
 
@@ -410,7 +499,7 @@ class CacheController(CoreController):
             )
             try:
                 await self.__migrate_database(prev_version)
-            except Exception as err:
+            except Exception as err:  # noqa: BLE001 - a failed migration resets the cache instead of stopping startup
                 LOGGER.warning("Cache database migration failed: %s, resetting cache", err)
                 await self.database.execute(f"DROP TABLE IF EXISTS {DB_TABLE_CACHE}")
                 await self.__create_database_tables()
@@ -436,7 +525,7 @@ class CacheController(CoreController):
                 )
                 await self.database.vacuum()
                 self.logger.debug("Compacting database done")
-        except Exception as err:
+        except sqlite3.Error as err:
             self.logger.warning("Database vacuum failed: %s", str(err))
 
     async def __create_database_tables(self) -> None:

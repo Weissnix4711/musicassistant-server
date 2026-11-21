@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, TypeVar, overload
+from typing import TYPE_CHECKING, ClassVar, TypeVar, overload
 
 from music_assistant_models.config_entries import ConfigValueType
 from music_assistant_models.enums import ProviderStage, ProviderType
@@ -14,13 +14,16 @@ from music_assistant_models.provider import ProviderManifest
 from music_assistant.constants import CONF_LOG_LEVEL, MASS_LOGGER_NAME
 
 if TYPE_CHECKING:
-    from music_assistant_models.config_entries import ConfigEntry, CoreConfig
+    from music_assistant_models.config_entries import ConfigActionResult, ConfigEntry, CoreConfig
 
     from music_assistant.helpers.json import SerializableType
+    from music_assistant.helpers.plugin_engines import EngineSetting
     from music_assistant.mass import MusicAssistant
 
 # TypeVar for config value type inference
 _ConfigValueT = TypeVar("_ConfigValueT", bound=ConfigValueType)
+
+CORE_DOCS_URL = "https://music-assistant.io/settings/core/"
 
 
 class CoreController:
@@ -32,6 +35,8 @@ class CoreController:
     # up to date by the config controller, so internal code can read config values
     # (including entry defaults) without rebuilding the config entries
     config: CoreConfig
+    # the AI engine settings of this module, listed on the AI settings page
+    engine_settings: ClassVar[tuple[EngineSetting, ...]] = ()
 
     def __init__(self, mass: MusicAssistant) -> None:
         """Initialize core controller."""
@@ -46,6 +51,7 @@ class CoreController:
             codeowners=["@music-assistant"],
             stage=ProviderStage.STABLE,
             icon="puzzle-outline",
+            documentation=f"{CORE_DOCS_URL}#{self.domain.replace('_', '-')}",
             builtin=True,
             allow_disable=False,
         )
@@ -64,12 +70,17 @@ class CoreController:
         """
         return ()
 
-    async def handle_config_action(self, action: str) -> tuple[ConfigEntry, ...]:
+    async def handle_config_action(
+        self, action: str
+    ) -> tuple[ConfigEntry, ...] | ConfigActionResult | None:
         """
-        Handle a one-shot action button press from this module's config and re-render.
+        Run the one-shot side effect for a pressed action button from this module's config.
 
         Override to run the side effect for each ``ConfigEntryType.ACTION`` entry this
-        module declares, then return the (possibly refreshed) config entries to display.
+        module declares. Return a ``ConfigActionResult`` to report the outcome (a message
+        to show and/or a url to open), or None when there is nothing to report. Raise to
+        report failure to the caller. Returning config entries re-renders the config form
+        with those entries instead.
 
         :param action: The action id of the pressed button (an entry's ``action`` key).
         """

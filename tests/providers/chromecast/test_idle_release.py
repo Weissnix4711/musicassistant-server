@@ -1,0 +1,259 @@
+"""
+Tests for how ChromecastPlayer releases a Cast device once playback ends by itself.
+
+Playback that finishes on its own never gets a stop command: the queue simply runs
+out, or an announcement ends. Without a release the receiver app stays loaded, which
+on a TV or Nest Hub means Music Assistant stays on screen instead of the backdrop.
+"""
+
+from __future__ import annotations
+
+from typing import Any, cast
+from unittest.mock import MagicMock
+
+import pytest
+from music_assistant_models.enums import PlaybackState, PlayerType
+from pychromecast import IDLE_APP_ID
+
+from music_assistant.providers.chromecast.constants import (
+    APP_MEDIA_RECEIVER,
+    APP_QUIT_DELAY,
+    MASS_APP_ID,
+)
+from music_assistant.providers.chromecast.player import ChromecastPlayer
+
+MASS_STREAM_BASE = "http://192.168.1.10:8097"
+
+
+def _fake_player(
+    *,
+    prev_state: PlaybackState = PlaybackState.PLAYING,
+    player_type: PlayerType = PlayerType.PLAYER,
+    active_cast_group: str | None = None,
+) -> Any:
+    """
+    Build a Cast player on mocked collaborators, so it handles media status for real.
+
+    :param prev_state: Playback state the player was in before the status arrives.
+    :param player_type: Type of the player.
+    :param active_cast_group: Player id of the cast group the player plays through, if any.
+    """
+    # __init__ is skipped: it needs a provider, cast info and a live Chromecast connection.
+    # Typed as Any because the collaborators below are read back as the mocks they are.
+    fake = cast("Any", ChromecastPlayer.__new__(ChromecastPlayer))
+    fake._player = None
+    fake.mass = MagicMock()
+    fake._provider = MagicMock(get_protocol=lambda pid: fake.mass.players.get_protocol(pid))
+    fake.logger = MagicMock()
+    fake.cc = MagicMock(app_id=MASS_APP_ID)
+    fake.update_state = MagicMock()
+    fake._media_error_reported = False
+    fake._app_quit_task_id = "cast_quit_app_test"
+    fake._app_track_change_task_id = "cast_app_track_change_test"
+    fake.active_cast_group = active_cast_group
+    # an unattached protocol shows the name its device reports
+    fake._cache = {}
+    fake._attr_name = "Test Cast"
+    # the state below is exposed through read-only properties on the base Player,
+    # so it is seeded through the attributes backing them
+    fake._attr_type = player_type
+    fake._attr_powered = False
+    fake._attr_group_members = []
+    fake._attr_playback_state = prev_state
+    fake._attr_source_list = []
+    fake.mass.streams.base_url = MASS_STREAM_BASE
+    return fake
+
+
+def _media_status(
+    *,
+    playing: bool = False,
+    paused: bool = False,
+    content_id: str = "",
+) -> MagicMock:
+    """
+    Build a MediaStatus as the receiver reports it.
+
+    :param playing: Whether the receiver reports playback.
+    :param paused: Whether the receiver reports paused playback.
+    :param content_id: Content id the receiver has loaded, if any.
+    """
+    status = MagicMock()
+    status.content_id = content_id
+    status.player_state = "PLAYING" if playing else "PAUSED" if paused else "IDLE"
+    status.player_is_playing = playing
+    status.player_is_paused = paused
+    status.player_is_idle = not playing and not paused
+    return status
+
+
+def _assert_release_not_scheduled(fake: Any) -> None:
+    released = [
+        c for c in fake.mass.call_later.call_args_list if fake._quit_app_when_unused in c.args
+    ]
+    assert released == []
+
+
+def _assert_release_scheduled(fake: Any) -> None:
+    fake.mass.call_later.assert_called_once_with(
+        APP_QUIT_DELAY, fake._quit_app_when_unused, task_id=fake._app_quit_task_id
+    )
+
+
+@pytest.mark.parametrize(("playing", "paused"), [(True, False), (False, True)])
+def test_playback_ending_releases_the_device(playing: bool, paused: bool) -> None:
+    """Nothing follows up on playback that ended on its own, so the device is released."""
+    fake = _fake_player(prev_state=PlaybackState.IDLE)
+    fake._handle_media_status(
+        _media_status(playing=playing, paused=paused, content_id=f"{MASS_STREAM_BASE}/track.flac")
+    )
+
+    fake._handle_media_status(_media_status())
+
+    assert fake._attr_playback_state == PlaybackState.IDLE
+    _assert_release_scheduled(fake)
+
+
+def test_an_announcement_on_an_idle_player_releases_the_device() -> None:
+    """
+    An announcement claims an idle device, so it must hand it back afterwards.
+
+    The player is never stopped in this flow (there was nothing to stop), which is
+    what used to leave the receiver app loaded for good.
+    """
+    fake = _fake_player(prev_state=PlaybackState.IDLE)
+
+    fake._handle_media_status(_media_status(playing=True, content_id="http://mass/announce.mp3"))
+    assert fake._attr_playback_state == PlaybackState.PLAYING
+    fake.mass.call_later.assert_not_called()
+
+    fake._handle_media_status(_media_status())
+
+    _assert_release_scheduled(fake)
+
+
+@pytest.mark.parametrize("app_id", [None, IDLE_APP_ID])
+def test_a_released_device_does_not_become_a_source(app_id: str | None) -> None:
+    """A released device sits on its backdrop, which is not something to select."""
+    fake = _fake_player()
+    fake.cc.app_id = app_id
+    fake._attr_source_list = []
+    # the source the released device was on, so the assertion proves it is cleared
+    fake._attr_active_source = "previous_source"
+
+    fake._handle_media_status(_media_status())
+
+    assert fake._attr_active_source is None
+    assert fake._attr_source_list == []
+
+
+def test_pausing_keeps_the_device_claimed() -> None:
+    """A paused player is meant to be resumed, so it keeps its Cast session."""
+    fake = _fake_player()
+
+    fake._handle_media_status(_media_status(paused=True, content_id="http://mass/track.flac"))
+
+    assert fake._attr_playback_state == PlaybackState.PAUSED
+    fake.mass.call_later.assert_not_called()
+
+
+def test_an_idle_player_is_not_released_again() -> None:
+    """A player that was already idle has no session of its own to release."""
+    fake = _fake_player(prev_state=PlaybackState.IDLE)
+    # set as after our own playback, so only the was-playing guard keeps it claimed
+    fake._playing_own_session = True
+
+    fake._handle_media_status(_media_status())
+
+    fake.mass.call_later.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("content_id", "playing", "paused"),
+    [
+        ("https://cast.music-assistant.io/dashboard-keepalive.mp4", True, False),
+        ("https://cast.music-assistant.io/keepalive.png", False, True),
+    ],
+)
+def test_a_dashboard_keepalive_does_not_release_the_device(
+    content_id: str, playing: bool, paused: bool
+) -> None:
+    """The receiver is showing a dashboard, so the device is deliberately kept claimed."""
+    fake = _fake_player()
+
+    fake._handle_media_status(_media_status(playing=playing, paused=paused, content_id=content_id))
+
+    assert fake._attr_playback_state == PlaybackState.IDLE
+    fake.mass.call_later.assert_not_called()
+
+
+def test_a_cast_group_is_not_released_when_playback_ends() -> None:
+    """A cast group is released by its power control, not by playback ending."""
+    fake = _fake_player(player_type=PlayerType.GROUP)
+    # our own playback is what ends, so only the group guard keeps the device claimed
+    fake._playing_own_session = True
+
+    fake._handle_media_status(_media_status())
+
+    assert fake._attr_playback_state == PlaybackState.IDLE
+    fake.mass.call_later.assert_not_called()
+
+
+def test_a_group_member_is_not_released_when_the_group_stops() -> None:
+    """A member follows the group's Cast session, so it has none of its own to release."""
+    fake = _fake_player(active_cast_group="group_player_1")
+    # the group's own playback is what ends, so only the member guard keeps it claimed
+    fake._playing_own_session = True
+    # the handler reads the group's status instead of its own, but only for a real cast player
+    group = MagicMock(spec=ChromecastPlayer)
+    group.cc = MagicMock()
+    group.cc.media_controller.status = _media_status()
+    fake.mass.players.get_protocol.return_value = group
+
+    fake._handle_media_status(_media_status())
+
+    assert fake._attr_playback_state == PlaybackState.IDLE
+    fake.mass.call_later.assert_not_called()
+
+
+def test_our_stream_on_the_default_media_receiver_releases_the_device() -> None:
+    """Without the Music Assistant app, our stream plays on the Default Media Receiver."""
+    fake = _fake_player(prev_state=PlaybackState.IDLE)
+    fake.cc.app_id = APP_MEDIA_RECEIVER
+
+    fake._handle_media_status(
+        _media_status(playing=True, content_id=f"{MASS_STREAM_BASE}/flow/abc.flac")
+    )
+    # once playback ended the receiver may report nothing loaded
+    fake._handle_media_status(_media_status())
+
+    _assert_release_scheduled(fake)
+
+
+@pytest.mark.parametrize("idle_content_id", ["", "http://192.168.1.20:8123/media/chime.mp3"])
+def test_playback_cast_by_another_party_is_not_released(idle_content_id: str) -> None:
+    """
+    A cast by another party (such as Home Assistant) keeps the receiver's own idle timeout.
+
+    Quitting it would end that party's session, so its next cast would start a new one
+    and the device would play its connect chime.
+
+    :param idle_content_id: What the receiver still reports as loaded once playback ended.
+    """
+    fake = _fake_player(prev_state=PlaybackState.IDLE)
+    fake.cc.app_id = APP_MEDIA_RECEIVER
+    fake.cc.app_display_name = "Default Media Receiver"
+
+    fake._handle_media_status(
+        _media_status(playing=True, content_id="http://192.168.1.20:8123/media/chime.mp3")
+    )
+    idle = _media_status(content_id=idle_content_id)
+    fake.cc.media_controller.status = idle
+    fake._handle_media_status(idle)
+    if fake._app_track_change_ends is not None:
+        # an idle app that still reports its media may only be moving to its next track,
+        # so the player waits for that before it takes the playback as ended
+        fake._end_app_track_change()
+
+    assert fake._attr_playback_state == PlaybackState.IDLE
+    _assert_release_not_scheduled(fake)

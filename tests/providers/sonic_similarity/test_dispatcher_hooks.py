@@ -9,6 +9,7 @@ import pytest
 from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items import RecommendationFolder
 
+from tests.common import use_real_create_task
 from tests.providers.sonic_similarity.conftest import make_item_mapping, make_track
 
 if TYPE_CHECKING:
@@ -64,7 +65,9 @@ class TestGetSimilarTracks:
         plugin._handle_similar.assert_awaited_once_with(
             item_id="seed_id", seed_provider="spotify", limit=10, preset="balanced", diversity=0.0
         )
-        mock_mass.music.tracks.get.assert_awaited_once_with("result1", "spotify")
+        mock_mass.music.tracks.get.assert_awaited_once_with(
+            "result1", "spotify", allow_update_metadata=False, recursive=False
+        )
 
     @pytest.mark.asyncio
     async def test_falls_back_to_signatures_by_id(
@@ -189,6 +192,11 @@ class TestGetRecommendations:
 
 class TestGetRecommendationItems:
     """Tests for SonicSimilarityPlugin.get_recommendation_items."""
+
+    @pytest.fixture(autouse=True)
+    def _real_create_task(self, mock_mass: MagicMock) -> None:
+        """Let the @use_cache decorator on the row fetch dispatch through a real task."""
+        use_real_create_task(mock_mass)
 
     @pytest.mark.asyncio
     async def test_unknown_item_id_returns_empty_without_backend_io(

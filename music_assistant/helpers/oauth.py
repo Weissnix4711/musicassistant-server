@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+from urllib.parse import parse_qs, urlparse
+
 from music_assistant.models.setup_flow import SetupFlowError
 
 # Fixed https redirect URI that OAuth providers which only allow pre-registered
@@ -21,11 +24,13 @@ def hosted_bounce_redirect(callback_url: str) -> tuple[str, str]:
     Return the (redirect_uri, state) pair for a hosted-bounce OAuth authorize URL.
 
     The redirect_uri is the fixed MA callback page the provider has pre-registered;
-    it forwards the browser to the flow's local callback URL, carried in `state`.
+    it forwards the browser to the flow's local callback URL, carried base64url encoded
+    (without padding) in `state`.
 
     :param callback_url: The setup session's local callback URL (session.callback_url).
     """
-    return HOSTED_CALLBACK_URL, callback_url
+    state = base64.urlsafe_b64encode(callback_url.encode()).decode().rstrip("=")
+    return HOSTED_CALLBACK_URL, state
 
 
 def authorization_code_from_params(params: dict[str, str]) -> str:
@@ -40,3 +45,19 @@ def authorization_code_from_params(params: dict[str, str]) -> str:
         error = params.get("error") or "no authorization code returned"
         raise SetupFlowError(f"Authorization failed: {error}")
     return code
+
+
+def authorization_code_from_url(url: str) -> str:
+    """
+    Return the authorization code from a redirect URL the user pasted back into a form.
+
+    For providers whose OAuth client only accepts loopback redirect URIs, the browser cannot
+    reach Music Assistant and the user copies the URL it landed on instead.
+
+    :param url: The full redirect URL, as pasted by the user.
+    :raises SetupFlowError: When the URL carries no usable authorization code.
+    """
+    query = parse_qs(urlparse(url.strip()).query)
+    return authorization_code_from_params(
+        {key: values[0] for key, values in query.items() if values}
+    )

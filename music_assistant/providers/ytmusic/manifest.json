@@ -5,11 +5,12 @@
   "name": "YouTube Music",
   "description": "Stream songs and podcasts from YouTube Music.",
   "codeowners": ["@MarvinSchenkel"],
+  "provides": ["artist", "album", "track", "playlist", "podcast"],
   "credits": ["[ytmusicapi](https://github.com/sigma67/ytmusicapi)"],
   "requirements": [
-    "ytmusicapi==1.12.1",
+    "ytmusicapi==1.12.3",
     "duration-parser==1.0.1",
-    "deno==2.7.12"
+    "deno==2.9.6"
   ],
   "documentation": "https://music-assistant.io/music-providers/youtube-music/",
   "multi_instance": true

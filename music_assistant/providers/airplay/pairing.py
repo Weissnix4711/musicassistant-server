@@ -17,6 +17,7 @@ import hashlib
 import logging
 import os
 import plistlib
+import re
 
 import aiohttp
 from cryptography.hazmat.primitives import serialization
@@ -27,11 +28,24 @@ from music_assistant_models.errors import PlayerCommandFailed
 from music_assistant.helpers.process import AsyncProcess
 from music_assistant.helpers.util import format_ip_for_url
 
-from .constants import StreamingProtocol
+from .constants import AIRPLAY_DEFAULT_PORT, RAOP_DEFAULT_PORT, StreamingProtocol
 from .helpers import get_cli_binary
 
 # Timeout for the binary to complete the SRP exchange after the PIN is entered
 PAIR_SETUP_TIMEOUT = 60
+
+# Headers the receiver needs to show its PIN on /pair-pin-start: OS 27 receivers
+# refuse the request without HAP headers and only display the code when the
+# client names itself. Same values as the cliairplay binary sends.
+PAIR_PIN_START_HEADERS = {
+    "User-Agent": "AirPlay/670.6.2",
+    "X-Apple-HKP": "3",
+    "Content-Type": "application/octet-stream",
+    "X-Apple-Client-Name": "Music Assistant",
+}
+
+# HAP error tag in the binary's pair-setup stderr lines ("... error tag: 3 (backoff ...)")
+HAP_ERROR_TAG_RE = re.compile(r"error tag: (\d+)")
 
 # ============================================================================
 # RAOP Pairing constants (for AirPlay 1 legacy)
@@ -85,7 +99,9 @@ class AirPlayPairing:
         self.name = name
         self.protocol = protocol
         self.logger = logger
-        self.port = port or (7000 if protocol == StreamingProtocol.AIRPLAY2 else 5000)
+        self.port = port or (
+            AIRPLAY_DEFAULT_PORT if protocol == StreamingProtocol.AIRPLAY2 else RAOP_DEFAULT_PORT
+        )
         self.device_id = device_id
 
         # cliairplay --pair-setup subprocess state (AirPlay 2)
@@ -141,6 +157,7 @@ class AirPlayPairing:
             # Request PIN to be shown on device
             async with self._session.post(
                 f"{self._base_url}/pair-pin-start",
+                headers=PAIR_PIN_START_HEADERS,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status != 200:
@@ -165,7 +182,7 @@ class AirPlayPairing:
             if self.protocol == StreamingProtocol.AIRPLAY2:
                 return await self._finish_cli_pair_setup(pin)
             if not self._session:
-                raise PlayerCommandFailed("Pairing not started")
+                raise PlayerCommandFailed("Pairing not started")  # noqa: TRY301 - handled by except below
             return await self._finish_raop_pairing(pin)
         except PlayerCommandFailed:
             raise
@@ -241,11 +258,9 @@ class AirPlayPairing:
             )
             returncode = await proc.wait_with_timeout(10)
         except (TimeoutError, BrokenPipeError, ConnectionResetError) as err:
-            raise PlayerCommandFailed(f"Pairing failed: {self._pair_setup_error()}") from err
+            raise self._pair_setup_failure("Pairing failed") from err
         if not credentials or returncode != 0:
-            raise PlayerCommandFailed(
-                f"Pairing failed (exit code {returncode}): {self._pair_setup_error()}"
-            )
+            raise self._pair_setup_failure(f"Pairing failed (exit code {returncode})")
         if len(credentials) != 192:
             raise PlayerCommandFailed(
                 f"Pairing produced invalid credentials (length {len(credentials)})"
@@ -264,14 +279,45 @@ class AirPlayPairing:
                     return line.split(":", 1)[1].strip()
         return None
 
+    def _pair_setup_failure(self, summary: str) -> PlayerCommandFailed:
+        """
+        Build the pairing failure carrying the most specific error detail available.
+
+        :param summary: Short summary prefixed to the error detail.
+        """
+        detail = f"{summary}: {self._pair_setup_error()}"
+        translation_key = self._pair_setup_translation_key() or "pairing_failed"
+        return PlayerCommandFailed(detail, translation_key=translation_key)
+
+    def _pair_setup_translation_key(self) -> str | None:
+        """Map the HAP error tag from the pair-setup stderr (if any) to an error translation."""
+        for line in reversed(self._pair_proc_stderr):
+            if match := HAP_ERROR_TAG_RE.search(line):
+                tag = int(match.group(1))
+                if tag == 2:
+                    return "pairing_wrong_pin"
+                if tag in (3, 5):
+                    # backoff/max tries: the device rate-limits pairing attempts
+                    return "pairing_backoff"
+        return None
+
     def _pair_setup_error(self) -> str:
         """Return a short error description from the pair-setup stderr output."""
-        # the binary reports failures as plain lines on stderr; the last
-        # (non-prompt) line is the most specific one
-        for line in reversed(self._pair_proc_stderr):
-            if line and "Enter the PIN" not in line:
-                return line
-        return "no error details reported"
+        # the binary reports failures as plain lines on stderr; the last specific
+        # line wins, its generic "Pairing failed." trailer only as a last resort
+        fallback = "no error details reported"
+        for raw_line in reversed(self._pair_proc_stderr):
+            # the PIN prompt is written without a newline, so it arrives glued
+            # to the front of the next line - strip it rather than skip the line
+            line = raw_line.split("Enter the PIN shown on the device:")[-1].strip()
+            if not line:
+                continue
+            if line == "Pairing failed.":
+                fallback = line
+                continue
+            # strip the binary's log prefix ("[time] func:line [HAP] message")
+            return line.rsplit("] ", 1)[-1]
+        return fallback
 
     # ========================================================================
     # RAOP (AirPlay 1 legacy) pairing implementation
@@ -312,11 +358,11 @@ class AirPlayPairing:
         inner_hash = hashlib.sha1(f"{user_id}:{password}".encode()).digest()
         x = int.from_bytes(hashlib.sha1(salt + inner_hash).digest(), "big")
 
-        # k = H(N | PAD(g))
+        # k = H(N | PAD(g))  # noqa: ERA001
         g_padded = bytes.fromhex(RAOP_SRP_GENERATOR).rjust(n_len, b"\x00")
         k = int.from_bytes(hashlib.sha1(n_bytes + g_padded).digest(), "big")
 
-        # u = H(PAD(A) | PAD(B))
+        # u = H(PAD(A) | PAD(B))  # noqa: ERA001
         a_padded = client_public.rjust(n_len, b"\x00")
         b_padded = server_public.rjust(n_len, b"\x00")
         u = int.from_bytes(hashlib.sha1(a_padded + b_padded).digest(), "big")

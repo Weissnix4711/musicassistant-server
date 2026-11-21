@@ -5,7 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
+from aiohttp import ClientConnectorCertificateError, ClientConnectorSSLError, ClientResponseError
 from libopensonic import AsyncConnection as SonicConnection
+from libopensonic import Extensions as OpenSubsonicExtensions
 from libopensonic.errors import (
     AuthError,
     CredentialError,
@@ -20,6 +22,7 @@ from music_assistant_models.errors import (
     ActionUnavailable,
     LoginFailed,
     MediaNotFoundError,
+    MusicAssistantError,
     ProviderPermissionDenied,
     UnsupportedFeaturedException,
 )
@@ -34,12 +37,14 @@ from music_assistant_models.media_items import (
     Podcast,
     PodcastEpisode,
     ProviderMapping,
+    Radio,
     RecommendationFolder,
     SearchResults,
     Track,
     UniqueList,
 )
 from music_assistant_models.streamdetails import StreamDetails
+from yarl import URL
 
 from music_assistant.constants import (
     CONF_PASSWORD,
@@ -49,6 +54,8 @@ from music_assistant.constants import (
     UNKNOWN_ARTIST,
 )
 from music_assistant.controllers.cache import use_cache
+from music_assistant.helpers.playlists import move_playlist_block
+from music_assistant.helpers.podcast_parsers import rank_episodes_by_date
 from music_assistant.models.music_provider import MusicProvider
 
 from .parsers import (
@@ -60,25 +67,28 @@ from .parsers import (
     parse_epsiode,
     parse_playlist,
     parse_podcast,
+    parse_radio,
     parse_structured_lyrics,
     parse_track,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Sequence
 
     from libopensonic.media import AlbumID3 as SonicAlbum
-    from libopensonic.media import ArtistID3 as SonicArtist
+    from libopensonic.media import ArtistWithAlbumsID3 as SonicArtist
     from libopensonic.media import Bookmark as SonicBookmark
     from libopensonic.media import Child as SonicItem
+    from libopensonic.media import InternetRadioStation as SonicRadio
     from libopensonic.media import Lyrics as SonicLyrics
     from libopensonic.media import OpenSubsonicExtension, StructuredLyrics
     from libopensonic.media import Playlist as SonicPlaylist
     from libopensonic.media import PodcastEpisode as SonicEpisode
 
-
 CONF_BASE_URL = "baseURL"
+CONF_API_KEY = "api_key"
 CONF_ENABLE_PODCASTS = "enable_podcasts"
+CONF_ENABLE_RADIO_STATIONS = "enable_radio_stations"
 CONF_ENABLE_LEGACY_AUTH = "enable_legacy_auth"
 CONF_RECO_FAVES = "recommend_favorites"
 CONF_NEW_ALBUMS = "recommend_new"
@@ -99,12 +109,15 @@ class OpenSonicProvider(MusicProvider):
 
     conn: SonicConnection
     _enable_podcasts: bool = True
+    _enable_radio_stations: bool = True
     _show_faves: bool = True
     _show_new: bool = True
     _show_played: bool = True
     _reco_limit: int = 10
     _pagination_size: int = 200
     _id_lyrics: bool = False
+    _direct_podcast_episode: bool = False
+    _sonic_similarity: bool = False
     _raw_file: bool = True
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
@@ -114,13 +127,14 @@ class OpenSonicProvider(MusicProvider):
                 key=CONF_ENABLE_PODCASTS,
                 type=ConfigEntryType.BOOLEAN,
                 required=True,
+                hidden=True,
                 default_value=True,
             ),
             ConfigEntry(
-                key=CONF_ENABLE_LEGACY_AUTH,
+                key=CONF_ENABLE_RADIO_STATIONS,
                 type=ConfigEntryType.BOOLEAN,
                 required=True,
-                default_value=False,
+                default_value=True,
             ),
             ConfigEntry(
                 key=CONF_RECO_FAVES,
@@ -164,47 +178,81 @@ class OpenSonicProvider(MusicProvider):
     async def handle_async_init(self) -> None:
         """Set up the music provider and test the connection."""
         port = self.get_setup_value(CONF_PORT)
-        port = int(str(port)) if port is not None else 443
+        if port is not None:
+            port = int(str(port))
+        else:
+            # the scheme's default port (80/443), 443 when the url carries no scheme
+            port = URL(str(self.get_setup_value(CONF_BASE_URL))).port or 443
         path = self.get_setup_value(CONF_PATH)
 
         if path is None:
             path = ""
 
-        self.conn = SonicConnection(
-            str(self.get_setup_value(CONF_BASE_URL)),
-            username=str(self.get_setup_value(CONF_USERNAME)),
-            password=str(self.get_setup_value(CONF_PASSWORD)),
-            legacy_auth=bool(self.config.get_value(CONF_ENABLE_LEGACY_AUTH)),
-            port=port,
-            server_path=str(path),
-            use_get=True,
-            app_name="Music Assistant",
-        )
+        api_key = self.get_setup_value(CONF_API_KEY)
+        username = self.get_setup_value(CONF_USERNAME)
+        password = self.get_setup_value(CONF_PASSWORD)
 
-        try:
-            success = await self.conn.ping()
-            if not success:
-                raise CredentialError
-        except (AuthError, CredentialError) as e:
-            msg = (
-                f"Failed to connect to {self.get_setup_value(CONF_BASE_URL)}, check your settings."
+        if api_key:
+            self.conn = SonicConnection(
+                str(self.get_setup_value(CONF_BASE_URL)),
+                api_key=str(api_key),
+                port=port,
+                server_path=str(path),
+                use_get=True,
+                app_name="Music Assistant",
             )
+        elif username and password:
+            self.conn = SonicConnection(
+                str(self.get_setup_value(CONF_BASE_URL)),
+                username=str(username),
+                password=str(password),
+                legacy_auth=bool(self.get_setup_value(CONF_ENABLE_LEGACY_AUTH)),
+                port=port,
+                server_path=str(path),
+                use_get=True,
+                app_name="Music Assistant",
+            )
+        else:
+            msg = f"No credentials for {self.get_setup_value(CONF_BASE_URL)}, provide an API key or username and password."
             raise LoginFailed(
                 msg,
                 translation_key="connect_failed",
                 translation_owner=self.translation_owner,
                 translation_args=[self.get_setup_value(CONF_BASE_URL)],
-            ) from e
+            )
+
+        await self._verify_connection()
 
         try:
             extensions: list[OpenSubsonicExtension] = await self.conn.get_open_subsonic_extensions()
             for entry in extensions:
-                if entry.name == "songLyrics":
+                if entry.name == OpenSubsonicExtensions.SONG_LYRICS:
                     self._id_lyrics = True
+                elif entry.name == OpenSubsonicExtensions.GET_PODCAST_EPISODE:
+                    self._direct_podcast_episode = True
+                elif entry.name == OpenSubsonicExtensions.SONIC_SIMILARITY:
+                    self._sonic_similarity = True
         except OSError:
             self.logger.info("Failed to query server for OpenSubsonic extensions")
 
-        self._enable_podcasts = bool(self.config.get_value(CONF_ENABLE_PODCASTS))
+        # Migration from the old subsonic config for enabling podcasts + the generic library sync option
+        # to a only using the library sync (plus probing a podcast endpoint)
+        # After this code has gone out in a release which marks the podcast option
+        # as not visible, we will drop that config option entirely and set
+        # _enable_podcasts to the result of the probe
+
+        can_podcast = False
+        if bool(self.config.get_value("library_sync_podcasts")):
+            try:
+                await self.conn.get_podcasts(inc_episodes=False)
+                can_podcast = True
+            except SonicError:
+                self.logger.info("Server does not support podcasts, disabling")
+            except ClientResponseError:
+                self.logger.info("Server does not support podcasts, disabling")
+
+        self._enable_podcasts = bool(self.config.get_value(CONF_ENABLE_PODCASTS)) and can_podcast
+        self._enable_radio_stations = bool(self.config.get_value(CONF_ENABLE_RADIO_STATIONS))
         self._show_faves = bool(self.config.get_value(CONF_RECO_FAVES))
         self._show_new = bool(self.config.get_value(CONF_NEW_ALBUMS))
         self._show_played = bool(self.config.get_value(CONF_PLAYED_ALBUMS))
@@ -300,40 +348,13 @@ class OpenSonicProvider(MusicProvider):
             return UniqueList()
         return folder.items
 
-    async def _get_podcast_episode(self, eid: str) -> SonicEpisode:
-        chan_id, ep_id = eid.split(EP_CHAN_SEP)
-        chan = await self.conn.get_podcasts(inc_episodes=True, pid=chan_id)
-
-        if not chan[0].episode:
-            raise MediaNotFoundError(f"Missing episode list for podcast channel '{chan[0].id}'")
-
-        for episode in chan[0].episode:
-            if episode.id == ep_id:
-                return episode
-
-        msg = f"Can't find episode {ep_id} in podcast {chan_id}"
-        raise MediaNotFoundError(msg)
-
-    def _set_loudness(self, item: SonicItem) -> None:
-        if item.replay_gain and item.replay_gain.track_gain is not None:
-            # Convert ReplayGain values (gain in dB) to integrated loudness (LUFS)
-            track_loudness = -18 - item.replay_gain.track_gain
-            album_loudness = (
-                -18 - item.replay_gain.album_gain
-                if item.replay_gain.album_gain is not None
-                else None
-            )
-            self.mass.create_task(
-                self.mass.streams.audio_analysis.set_track_loudness(
-                    item.id,
-                    self.instance_id,
-                    track_loudness,
-                    album_loudness,
-                )
-            )
-
     async def resolve_image(self, path: str) -> bytes | Any:
-        """Return the image."""
+        """
+        Return cover artwork, or None if the server does not have it.
+
+        :param path: The cover art ID on the server.
+        :raises MusicAssistantError: If the server rejects the cover art request.
+        """
         self.logger.debug("Requesting cover art for '%s'", path)
 
         try:
@@ -342,6 +363,18 @@ class OpenSonicProvider(MusicProvider):
         except DataNotFoundError:
             self.logger.warning("Unable to locate a cover image for %s", path)
             return None
+        except SonicError as err:
+            msg = f"Open Subsonic could not retrieve cover art {path}"
+            raise MusicAssistantError(msg) from err
+
+    def accepts_stored_image_path(self, path: str) -> bool:
+        """
+        Return whether path can be a cover art id of the Subsonic server.
+
+        :param path: The stored image path.
+        """
+        # a cover art id is opaque and only ever sent to the server, which decides if it exists
+        return bool(path)
 
     @use_cache(3600 * 3)  # cache for 3 hours
     async def search(
@@ -379,15 +412,20 @@ class OpenSonicProvider(MusicProvider):
             tr = []
             for entry in answer.song:
                 self._set_loudness(entry)
-                lyrics: tuple[str, bool] | None = await self.get_track_lyrics(entry)
-                tr.append(parse_track(self.logger, self.instance_id, entry, lyrics=lyrics))
+                tr.append(parse_track(self.logger, self.instance_id, entry))
         else:
             tr = []
 
         return SearchResults(artists=ar, albums=al, tracks=tr)
 
-    async def set_favorite(self, prov_item_id: str, media_type: MediaType, favorite: bool) -> None:
-        """Set or clear favorite on the server."""
+    async def set_favorite(
+        self, prov_item_id: str, media_type: MediaType, favorite: bool | None
+    ) -> None:
+        """
+        Set or clear favorite on the server.
+
+        Subsonic only knows starred or not, so both a dislike and an unset unstar the item.
+        """
         # The subsonic spec does not support favorite-ing anything but artists, albums, and tracks
         if media_type not in (MediaType.ARTIST, MediaType.ALBUM, MediaType.TRACK):
             return
@@ -451,6 +489,22 @@ class OpenSonicProvider(MusicProvider):
         results = await self.conn.get_playlists()
         for entry in results:
             yield parse_playlist(self.instance_id, entry)
+
+    async def get_library_radios(self) -> AsyncGenerator[Radio]:
+        """Provide a generator for library radio stations."""
+        if not self._enable_radio_stations:
+            return
+        stations: list[SonicRadio] = await self.conn.get_internet_radio_stations()
+        for entry in stations:
+            yield parse_radio(self.instance_id, entry)
+
+    async def get_radio(self, prov_radio_id: str) -> Radio:
+        """Return the requested radio station."""
+        async for station in self.get_library_radios():
+            if station.item_id == prov_radio_id:
+                return station
+        msg = f"Radio {prov_radio_id} not found"
+        raise MediaNotFoundError(msg)
 
     async def get_library_tracks(self) -> AsyncGenerator[Track]:
         """
@@ -631,9 +685,12 @@ class OpenSonicProvider(MusicProvider):
         if not channel.episode:
             return
 
-        for episode in channel.episode:
+        # rank on the publish date, so the order the server returns the episodes in does
+        # not decide the ordering
+        positions = rank_episodes_by_date([ep.publish_date for ep in channel.episode])
+        for position, episode in zip(positions, channel.episode, strict=True):
             self._set_loudness(episode)
-            yield parse_epsiode(self.instance_id, episode, channel)
+            yield parse_epsiode(self.instance_id, episode, channel, position)
 
     @use_cache(3600 * 3)  # cache for 3 hours
     async def get_podcast(self, prov_podcast_id: str) -> Podcast:
@@ -670,18 +727,14 @@ class OpenSonicProvider(MusicProvider):
         if not sonic_playlist.entry:
             return result
 
-        album: Album | None = None
         for index, sonic_song in enumerate(sonic_playlist.entry, 1):
-            aid = sonic_song.album_id or sonic_song.parent
-            if not aid:
-                self.logger.warning("Unable to find album for track %s", sonic_song.id)
-            if aid is not None and (not album or album.item_id != aid):
-                album = await self.get_album(prov_album_id=aid)
+            # A playlist can hold thousands of tracks, so we must not trigger a per-track
+            # metadata fetch here: parse_track derives the album reference from the playlist
+            # entry itself, and lyrics are fetched on demand when a track is played (get_track).
+            # Fetching album + lyrics per entry turned a single getPlaylist call into thousands
+            # of serial requests, making large playlists take minutes to start.
             self._set_loudness(sonic_song)
-            lyrics: tuple[str, bool] | None = await self.get_track_lyrics(sonic_song)
-            track = parse_track(
-                self.logger, self.instance_id, sonic_song, album=album, lyrics=lyrics
-            )
+            track = parse_track(self.logger, self.instance_id, sonic_song)
             track.position = index
             result.append(track)
         return result
@@ -702,13 +755,27 @@ class OpenSonicProvider(MusicProvider):
         tracks = []
         for entry in songs:
             self._set_loudness(entry)
-            lyrics: tuple[str, bool] | None = await self.get_track_lyrics(entry)
-            tracks.append(parse_track(self.logger, self.instance_id, entry, lyrics=lyrics))
+            tracks.append(parse_track(self.logger, self.instance_id, entry))
         return tracks
 
     @use_cache(3600 * 3)  # cache for 3 hours
     async def get_similar_tracks(self, prov_track_id: str, limit: int = 25) -> list[Track]:
         """Get tracks similar to selected track."""
+        if self._sonic_similarity:
+            try:
+                matches = await self.conn.get_sonic_similar_tracks(
+                    song_id=prov_track_id, count=limit
+                )
+            except (SonicError, ClientResponseError, TimeoutError) as e:
+                # A server can advertise the extension while its analysis backend is
+                # unavailable, so fall back to the metadata based getSimilarSongs.
+                self.logger.debug(
+                    "Sonic similarity lookup failed for %s, falling back: %s", prov_track_id, e
+                )
+            else:
+                if matches:
+                    sonic_songs = [m.entry for m in matches if m.entry.id != prov_track_id]
+                    return await self._parse_similar_songs(sonic_songs)
         try:
             songs: list[SonicItem] = await self.conn.get_similar_songs(
                 iid=prov_track_id, count=limit
@@ -719,12 +786,7 @@ class OpenSonicProvider(MusicProvider):
             # exception means we didn't find anything similar.
             self.logger.info(e)
             return []
-        tracks = []
-        for entry in songs:
-            self._set_loudness(entry)
-            lyrics: tuple[str, bool] | None = await self.get_track_lyrics(entry)
-            tracks.append(parse_track(self.logger, self.instance_id, entry, lyrics=lyrics))
-        return tracks
+        return await self._parse_similar_songs(songs)
 
     async def create_playlist(self, name: str, media_types: set[MediaType]) -> Playlist:
         """Create a new empty playlist on the server."""
@@ -772,6 +834,37 @@ class OpenSonicProvider(MusicProvider):
             msg = f"Failed to remove songs from {prov_playlist_id}, check your permissions."
             raise ProviderPermissionDenied(msg) from ex
 
+    async def move_playlist_track(
+        self, prov_playlist_id: str, from_position: int, to_position: int
+    ) -> None:
+        """Move one track of the playlist to another position (both 1-based)."""
+        await self.move_playlist_tracks(prov_playlist_id, [from_position], to_position)
+
+    async def move_playlist_tracks(
+        self, prov_playlist_id: str, positions: Sequence[int], to_position: int | None = None
+    ) -> None:
+        """
+        Move tracks of the playlist as one block to another position (all 1-based).
+
+        Note that the configured user must own the playlist to edit this way.
+        """
+        # the Subsonic API has no move, so the whole order is written back in one call that
+        # replaces the songs of the playlist
+        try:
+            sonic_playlist: SonicPlaylist = await self.conn.get_playlist(prov_playlist_id)
+        except (ParameterError, DataNotFoundError) as e:
+            msg = f"Playlist {prov_playlist_id} not found"
+            raise MediaNotFoundError(msg) from e
+        song_ids = [song.id for song in sonic_playlist.entry or []]
+        if to_position is None:
+            to_position = len(song_ids) - len(positions) + 1
+        song_ids = move_playlist_block(song_ids, positions, to_position)
+        try:
+            await self.conn.create_playlist(playlist_id=prov_playlist_id, song_ids=song_ids)
+        except SonicError as ex:
+            msg = f"Failed to reorder songs in {prov_playlist_id}, check your permissions."
+            raise ProviderPermissionDenied(msg) from ex
+
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Get the details needed to process a specified track."""
         item: SonicItem | SonicEpisode
@@ -801,6 +894,21 @@ class OpenSonicProvider(MusicProvider):
                 item.id,
                 item.content_type,
             )
+        elif media_type == MediaType.RADIO:
+            async for station in self.get_library_radios():
+                if station.item_id == item_id:
+                    return StreamDetails(
+                        item_id=item_id,
+                        provider=self.instance_id,
+                        allow_seek=False,
+                        can_seek=False,
+                        media_type=MediaType.RADIO,
+                        audio_format=AudioFormat(content_type=ContentType.UNKNOWN),
+                        stream_type=StreamType.HTTP,
+                        path=station.uri or "",
+                    )
+            msg = f"Radio {item_id} not found"
+            raise MediaNotFoundError(msg)
         else:
             msg = f"Unsupported media type encountered '{media_type}'"
             raise UnsupportedFeaturedException(msg)
@@ -903,10 +1011,75 @@ class OpenSonicProvider(MusicProvider):
                 return (
                     False,
                     mark.position,
-                    datetime.fromisoformat(mark.created) if mark.created else None,
+                    datetime.fromisoformat(mark.changed) if mark.changed else None,
                 )
         # If we get here, there is no bookmark
         return (False, 0, None)
+
+    async def get_track_lyrics(self, track: SonicItem) -> tuple[str, bool] | None:
+        """
+        Get lyrics for a track.
+
+        Fetches lyrics from Subsonic server. Returns the lyrics text in LRC format
+        if the Lyrics are synced (have time stamp info) or raw text if not
+        """
+        # Server doesn't support to newer lyrics retrieval, fall back to the old one
+        if not self._id_lyrics:
+            try:
+                ly: SonicLyrics = await self.conn.get_lyrics(track.title, track.artist)
+            except DataNotFoundError:
+                self.logger.debug("Lyrics not found for '%s' by '%s'", track.title, track.artist)
+                return None
+            return (ly.value, False)
+
+        try:
+            lyrics: list[StructuredLyrics] = await self.conn.get_lyrics_by_song_id(track.id)
+        except DataNotFoundError:
+            self.logger.debug("Lyrics not found for '%s'", track.id)
+            return None
+        if not lyrics:
+            return None
+        return parse_structured_lyrics(lyrics[0])
+
+    async def _get_podcast_episode(self, eid: str) -> SonicEpisode:
+        chan_id, ep_id = eid.split(EP_CHAN_SEP)
+
+        if self._direct_podcast_episode:
+            try:
+                return await self.conn.get_podcast_episode(ep_id)
+            except DataNotFoundError as e:
+                msg = f"Can't find episode {ep_id} in podcast {chan_id}"
+                raise MediaNotFoundError(msg) from e
+
+        chan = await self.conn.get_podcasts(inc_episodes=True, pid=chan_id)
+
+        if not chan[0].episode:
+            raise MediaNotFoundError(f"Missing episode list for podcast channel '{chan[0].id}'")
+
+        for episode in chan[0].episode:
+            if episode.id == ep_id:
+                return episode
+
+        msg = f"Can't find episode {ep_id} in podcast {chan_id}"
+        raise MediaNotFoundError(msg)
+
+    def _set_loudness(self, item: SonicItem) -> None:
+        if item.replay_gain and item.replay_gain.track_gain is not None:
+            # Convert ReplayGain values (gain in dB) to integrated loudness (LUFS)
+            track_loudness = -18 - item.replay_gain.track_gain
+            album_loudness = (
+                -18 - item.replay_gain.album_gain
+                if item.replay_gain.album_gain is not None
+                else None
+            )
+            self.mass.create_task(
+                self.mass.streams.audio_analysis.set_track_loudness(
+                    item.id,
+                    self.instance_id,
+                    track_loudness,
+                    album_loudness,
+                )
+            )
 
     async def _get_podcast_channel_async(self, chan_id: str) -> PodcastChannel | None:
         if cache := await self.mass.cache.get(
@@ -993,27 +1166,47 @@ class OpenSonicProvider(MusicProvider):
             recent.items.append(parse_album(self.logger, self.instance_id, sonic_album))
         return recent
 
-    async def get_track_lyrics(self, track: SonicItem) -> tuple[str, bool] | None:
-        """
-        Get lyrics for a track.
-
-        Fetches lyrics from Subsonic server. Returns the lyrics text in LRC format
-        if the Lyrics are synced (have time stamp info) or raw text if not
-        """
-        # Server doesn't support to newer lyrics retrieval, fall back to the old one
-        if not self._id_lyrics:
-            try:
-                ly: SonicLyrics = await self.conn.get_lyrics(track.title, track.artist)
-            except DataNotFoundError:
-                self.logger.debug("Lyrics not found for '%s' by '%s'", track.title, track.artist)
-                return None
-            return (ly.value, False)
-
+    async def _verify_connection(self) -> None:
+        """Ping the server, raising LoginFailed with a translated reason when that fails."""
+        base_url = self.get_setup_value(CONF_BASE_URL)
         try:
-            lyrics: list[StructuredLyrics] = await self.conn.get_lyrics_by_song_id(track.id)
-        except DataNotFoundError:
-            self.logger.debug("Lyrics not found for '%s'", track.id)
-            return None
-        if not lyrics:
-            return None
-        return parse_structured_lyrics(lyrics[0])
+            success = await self.conn.ping()
+            if not success:
+                raise CredentialError  # noqa: TRY301 - converted to LoginFailed below
+        except (AuthError, CredentialError) as e:
+            msg = f"Failed to connect to {base_url}, check your settings."
+            translation_key = "connect_failed"
+            cause: Exception = e
+        except ClientConnectorCertificateError as e:
+            msg = f"The certificate of {base_url} is not trusted."
+            translation_key = "certificate_not_trusted"
+            cause = e
+        except ClientConnectorSSLError as e:
+            # also raised when an https url points at a server that only speaks plain http
+            msg = (
+                f"Could not open a secure connection to {base_url}. "
+                "If the server only serves plain http, use an http:// address."
+            )
+            translation_key = "secure_connection_failed"
+            cause = e
+        else:
+            return
+        raise LoginFailed(
+            msg,
+            translation_key=translation_key,
+            translation_owner=self.translation_owner,
+            translation_args=[base_url],
+        ) from cause
+
+    async def _parse_similar_songs(self, songs: list[SonicItem]) -> list[Track]:
+        """
+        Parse a list of Subsonic songs into Tracks, including loudness and lyrics.
+
+        :param songs: The Subsonic songs to parse.
+        """
+        tracks = []
+        for entry in songs:
+            self._set_loudness(entry)
+            lyrics: tuple[str, bool] | None = await self.get_track_lyrics(entry)
+            tracks.append(parse_track(self.logger, self.instance_id, entry, lyrics=lyrics))
+        return tracks

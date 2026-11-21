@@ -10,6 +10,13 @@ from music_assistant_models.enums import PlaybackState
 if TYPE_CHECKING:
     import logging
 
+CONF_POWER_CONTROLS = "power_controls"
+CONF_MUTE_CONTROLS = "mute_controls"
+CONF_VOLUME_CONTROLS = "volume_controls"
+
+# Home Assistant entity domains Music Assistant can offer as player controls.
+CONTROL_DOMAINS = ("media_player", "switch", "input_boolean", "number", "input_number")
+
 
 class MediaPlayerEntityFeature(IntFlag):
     """Supported features of the media player entity."""
@@ -36,6 +43,14 @@ class MediaPlayerEntityFeature(IntFlag):
     GROUPING = 524288
     MEDIA_ANNOUNCE = 1048576
     MEDIA_ENQUEUE = 2097152
+
+
+class AITaskEntityFeature(IntFlag):
+    """Supported features of the AI task entity."""
+
+    GENERATE_DATA = 1
+    SUPPORT_ATTACHMENTS = 2
+    GENERATE_IMAGE = 4
 
 
 StateMap = {

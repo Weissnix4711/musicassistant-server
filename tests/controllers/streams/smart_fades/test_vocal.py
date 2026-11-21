@@ -18,7 +18,22 @@ from music_assistant.models.audio_analysis import AudioAnalysisData
 
 
 def _analysis(vocal_activity: object, duration: float | None = 240.0) -> AudioAnalysisData:
-    return AudioAnalysisData(duration=duration, extra_data={"vocal_activity": vocal_activity})
+    return AudioAnalysisData(
+        duration=duration,
+        vocal_activity=vocal_activity,  # type: ignore[arg-type]
+    )
+
+
+# Used only by TestBuildVocalWindowsSustainedEvidenceGate below.
+FRAME = 0.1  # 10 bins per second
+
+
+def _timeline(spec: list[tuple[float, int]]) -> list[float]:
+    """Flat probability segments: [(prob, n_bins), ...]."""
+    probs: list[float] = []
+    for prob, bins in spec:
+        probs.extend([prob] * bins)
+    return probs
 
 
 class TestParseVocalProbabilities:
@@ -45,8 +60,8 @@ class TestParseVocalProbabilities:
         assert parse_vocal_probabilities(AudioAnalysisData(duration=240.0)) is None
 
     def test_missing_vocal_activity_key_returns_none(self) -> None:
-        """extra_data present but without a vocal_activity entry."""
-        analysis = AudioAnalysisData(duration=240.0, extra_data={"band_rms": {}})
+        """extra_data present but with no vocal_activity data."""
+        analysis = AudioAnalysisData(duration=240.0, extra_data={"unrelated": "x"})
         assert parse_vocal_probabilities(analysis) is None
 
     @pytest.mark.parametrize(
@@ -97,6 +112,18 @@ class TestParseVocalProbabilities:
     def test_missing_or_invalid_duration_returns_none(self, duration: float | None) -> None:
         """Bin timing requires a finite positive analysis duration."""
         assert parse_vocal_probabilities(_analysis([0.1] * 1800, duration=duration)) is None
+
+    def test_legacy_extra_data_row_lifts_into_the_same_timeline(self) -> None:
+        """A pre-typed-field row shaped as extra_data["vocal_activity"] lifts to the same result."""
+        probabilities = [0.2] * 1800
+        legacy = AudioAnalysisData.from_dict(
+            {"duration": 240.0, "extra_data": {"vocal_activity": probabilities}}
+        )
+        assert legacy.extra_data is None
+        assert parse_vocal_probabilities(legacy) == VocalTimeline(
+            probabilities=probabilities,
+            frame_duration=240.0 / 1800,
+        )
 
 
 class TestBuildVocalWindows:
@@ -222,6 +249,35 @@ class TestBuildVocalWindows:
         mask = build_vocal_windows(probabilities, 0.1, 0.0, 5.0)
         assert len(mask.windows) == 1
         assert mask.windows[0][1] == pytest.approx(5.0)
+
+
+class TestBuildVocalWindowsSustainedEvidenceGate:
+    """A run only becomes a window when its peak OR its mean shows real confidence."""
+
+    def test_weak_backing_run_is_dropped(self) -> None:
+        """A 1.5s run peaking 0.69 (background 'aahh') never becomes a window."""
+        probs = _timeline([(0.0, 100), (0.55, 10), (0.69, 5), (0.0, 100)])
+        mask = build_vocal_windows(probs, FRAME, 0.0, len(probs) * FRAME)
+        assert mask.windows == []
+
+    def test_confident_peak_run_is_kept(self) -> None:
+        """A short run with a confident peak (real singing) still opens a window."""
+        probs = _timeline([(0.0, 100), (0.95, 15), (0.0, 100)])
+        mask = build_vocal_windows(probs, FRAME, 0.0, len(probs) * FRAME)
+        assert len(mask.windows) == 1
+
+    def test_sustained_medium_run_is_kept(self) -> None:
+        """A long medium-confidence run (soft verse, mean >= 0.65) is kept."""
+        # 0.70, not 0.65, so the assertion doesn't ride the mean-threshold boundary
+        probs = _timeline([(0.0, 50), (0.70, 80), (0.0, 50)])
+        mask = build_vocal_windows(probs, FRAME, 0.0, len(probs) * FRAME)
+        assert len(mask.windows) == 1
+
+    def test_moderate_mean_backing_run_is_dropped(self) -> None:
+        """A ~1.1s run just under both floors (peak 0.84, mean ~0.648) is dropped."""
+        probs = _timeline([(0.0, 100), (0.55, 5), (0.62, 3), (0.84, 3), (0.0, 100)])
+        mask = build_vocal_windows(probs, FRAME, 0.0, len(probs) * FRAME)
+        assert mask.windows == []
 
 
 class TestVocalMaskClampedTo:

@@ -29,9 +29,15 @@ from music_assistant_models.enums import (
 from music_assistant_models.errors import (
     LoginFailed,
     MediaNotFoundError,
+    ProviderUnavailableError,
     ResourceTemporarilyUnavailable,
 )
-from music_assistant_models.media_items import AudioFormat, Podcast, PodcastEpisode
+from music_assistant_models.media_items import (
+    AudioFormat,
+    MediaItemTranscriptCue,
+    Podcast,
+    PodcastEpisode,
+)
 from music_assistant_models.streamdetails import StreamDetails
 from yarl import URL
 
@@ -42,7 +48,10 @@ from music_assistant.helpers.datetime import from_iso_string
 from music_assistant.helpers.podcast_parsers import (
     enrich_episode_chapters,
     find_episode_stream_url,
+    find_episode_transcripts,
     get_cached_podcast,
+    get_episode_positions,
+    get_episode_transcript,
     get_stream_url_and_guid_from_episode,
     parse_podcast,
     parse_podcast_episode,
@@ -151,8 +160,8 @@ class OvercastProvider(MusicProvider):
                     feed_url=feed_url,
                     max_episodes=self.max_episodes,
                 )
-            except MediaNotFoundError:
-                self.logger.warning("Was unable to obtain podcast with feed %s", feed_url)
+            except (MediaNotFoundError, ProviderUnavailableError) as err:
+                self.report_skipped_sync_item(MediaType.PODCAST, feed_url, err)
                 continue
             applied = await self._apply_playback_states(feed_url, subscription, parsed_podcast)
             if applied is not None:
@@ -183,11 +192,13 @@ class OvercastProvider(MusicProvider):
         subscription = await self._get_subscription(prov_podcast_id)
         podcast_cover = podcast.get("cover_url")
         podcast_name = podcast.get("title")
-        for cnt, parsed_episode in enumerate(podcast.get("episodes", [])):
+        episodes = podcast.get("episodes", [])
+        positions = get_episode_positions(episodes)
+        for position, parsed_episode in zip(positions, episodes, strict=True):
             mass_episode = parse_podcast_episode(
                 episode=parsed_episode,
                 prov_podcast_id=prov_podcast_id,
-                episode_cnt=cnt,
+                position=position,
                 podcast_cover=podcast_cover,
                 podcast_name=podcast_name,
                 instance_id=self.instance_id,
@@ -206,6 +217,7 @@ class OvercastProvider(MusicProvider):
                 if state is not None and (state.played or state.progress_s):
                     mass_episode.resume_position_ms = (state.progress_s or 0) * 1000
                     mass_episode.fully_played = state.played
+                    mass_episode.resume_position_timestamp = state.user_updated_at
             yield mass_episode
 
     async def get_podcast_episode(self, prov_episode_id: str) -> PodcastEpisode:
@@ -217,6 +229,20 @@ class OvercastProvider(MusicProvider):
                 await self._enrich_episode_chapters(podcast_id, guid_or_stream_url, mass_episode)
                 return mass_episode
         raise MediaNotFoundError("Did not find episode.")
+
+    async def get_podcast_episode_transcript(
+        self, prov_episode_id: str
+    ) -> tuple[str | None, list[MediaItemTranscriptCue] | None]:
+        """Get the transcript for a podcast episode."""
+        podcast_id, guid_or_stream_url = prov_episode_id.split(" ", 1)
+        podcast = await self._cache_get_podcast(podcast_id)
+        return await get_episode_transcript(
+            mass=self.mass,
+            provider_instance_id=self.instance_id,
+            transcripts=find_episode_transcripts(
+                parsed_feed=podcast, guid_or_stream_url=guid_or_stream_url
+            ),
+        )
 
     async def get_resume_position(
         self, item_id: str, media_type: MediaType
@@ -257,12 +283,17 @@ class OvercastProvider(MusicProvider):
 
     async def _login(self) -> None:
         """Authenticate with Overcast and persist the session cookie."""
-        email = str(self.get_setup_value(CONF_USERNAME))
-        password = str(self.get_setup_value(CONF_PASSWORD))
+        email = self.get_setup_value(CONF_USERNAME)
+        password = self.get_setup_value(CONF_PASSWORD)
+        if not email or not password:
+            # an app linked account has no credentials to sign in with a second time
+            raise LoginFailed(
+                "The Overcast session has expired, set the provider up again to renew it"
+            )
         try:
             async with self.http_session.post(
                 LOGIN_URL,
-                data={"email": email, "password": password},
+                data={"email": str(email), "password": str(password)},
                 allow_redirects=False,
             ) as response:
                 status = response.status
@@ -373,7 +404,9 @@ class OvercastProvider(MusicProvider):
         newest_applied: datetime | None = None
         podcast_cover = parsed_podcast.get("cover_url")
         podcast_name = parsed_podcast.get("title")
-        for cnt, parsed_episode in enumerate(parsed_podcast.get("episodes", [])):
+        all_episodes = parsed_podcast.get("episodes", [])
+        positions = get_episode_positions(all_episodes)
+        for position, parsed_episode in zip(positions, all_episodes, strict=True):
             try:
                 stream_url, _ = get_stream_url_and_guid_from_episode(episode=parsed_episode)
             except ValueError:
@@ -392,7 +425,7 @@ class OvercastProvider(MusicProvider):
             mass_episode = parse_podcast_episode(
                 episode=parsed_episode,
                 prov_podcast_id=feed_url,
-                episode_cnt=cnt,
+                position=position,
                 podcast_cover=podcast_cover,
                 podcast_name=podcast_name,
                 instance_id=self.instance_id,
@@ -400,17 +433,17 @@ class OvercastProvider(MusicProvider):
             )
             if mass_episode is None:
                 continue
-            if not state.played:
-                # never move the user backwards: the playlog write replaces whatever MA
-                # recorded itself, which may be a position further into the episode
-                _, local_position_ms = await self.mass.music.get_resume_position(mass_episode)
-                if local_position_ms > (state.progress_s or 0) * 1000:
-                    continue
+            overcast_point = (state.played, (state.progress_s or 0) * 1000)
+            if await self.mass.music.get_resume_position(mass_episode) != overcast_point:
+                # the progress Music Assistant recorded itself wins
+                continue
             await self.mass.music.mark_item_played(
                 mass_episode,
                 fully_played=state.played,
                 seconds_played=state.progress_s or 0,
                 user_initiated=False,
+                provider_instance_id=self.instance_id,
+                progress_timestamp=int(state.user_updated_at.timestamp()),
             )
             if newest_applied is None or state.user_updated_at > newest_applied:
                 newest_applied = state.user_updated_at

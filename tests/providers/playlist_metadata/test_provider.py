@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncGenerator
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from music_assistant_models.enums import ImageType
+from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items import MediaItemImage, Playlist, ProviderMapping, Track
 from music_assistant_models.media_items.metadata import MediaItemMetadata
 from music_assistant_models.unique_list import UniqueList
+from PIL import Image, UnidentifiedImageError
 
 from music_assistant.constants import CONF_LOG_LEVEL
 from music_assistant.providers.playlist_metadata import PlaylistMetadataProvider
@@ -41,12 +44,12 @@ def _make_provider(tmp_path: Any) -> PlaylistMetadataProvider:
 
     provider = PlaylistMetadataProvider(mass, manifest, config, set())
     provider._images_dir = str(tmp_path / "playlist_images")
-    os.makedirs(provider._images_dir, exist_ok=True)
+    Path(provider._images_dir).mkdir(parents=True, exist_ok=True)
 
     return provider
 
 
-def _make_playlist() -> Playlist:
+def _make_playlist(provider_domain: str = "test_provider") -> Playlist:
     """Create a test playlist with tracks."""
     return Playlist(
         item_id="test_playlist_1",
@@ -55,7 +58,7 @@ def _make_playlist() -> Playlist:
         provider_mappings={
             ProviderMapping(
                 item_id="test_playlist_1",
-                provider_domain="test_provider",
+                provider_domain=provider_domain,
                 provider_instance="test",
             )
         },
@@ -128,7 +131,7 @@ async def test_get_playlist_metadata_returns_none_when_insufficient_images(
         if False:  # pragma: no cover
             yield  # type: ignore[unreachable]
 
-    with patch.object(provider.mass.music.playlists, "tracks", side_effect=mock_tracks_iter):
+    with patch.object(provider.mass.music.playlists, "iter_tracks", side_effect=mock_tracks_iter):
         result = await provider.get_playlist_metadata(playlist)
 
     assert result is None
@@ -160,7 +163,7 @@ async def test_get_playlist_metadata_returns_metadata_when_sufficient_images(
 
     # Mock _render to return fake image data
     with (
-        patch.object(provider.mass.music.playlists, "tracks", side_effect=mock_tracks_iter),
+        patch.object(provider.mass.music.playlists, "iter_tracks", side_effect=mock_tracks_iter),
         patch.object(provider, "_render", new_callable=AsyncMock) as mock_render,
     ):
         mock_render.return_value = b"fake_image_data"
@@ -176,15 +179,99 @@ async def test_get_playlist_metadata_returns_metadata_when_sufficient_images(
         thumb_image = next((img for img in result.images if img.type == ImageType.THUMB), None)
         assert thumb_image is not None
         assert thumb_image.provider == "playlist_metadata"
-        assert os.path.exists(thumb_image.path)
+        assert Path(thumb_image.path).exists()
         assert "_thumb.jpg" in thumb_image.path
 
         # Check FANART image
         fanart_image = next((img for img in result.images if img.type == ImageType.FANART), None)
         assert fanart_image is not None
         assert fanart_image.provider == "playlist_metadata"
-        assert os.path.exists(fanart_image.path)
+        assert Path(fanart_image.path).exists()
         assert "_fanart.jpg" in fanart_image.path
+
+
+@pytest.mark.parametrize(
+    ("provider_domain", "skip_provider_playlists", "service_image_types", "expected_types"),
+    [
+        # our own previously generated cover does not count as the service's cover
+        ("test_provider", True, set(), {ImageType.THUMB, ImageType.FANART}),
+        ("test_provider", True, {ImageType.THUMB}, set()),
+        ("test_provider", False, {ImageType.THUMB}, {ImageType.FANART}),
+        ("test_provider", False, {ImageType.THUMB, ImageType.FANART}, set()),
+        ("builtin", True, {ImageType.THUMB, ImageType.FANART}, {ImageType.THUMB, ImageType.FANART}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_get_playlist_metadata_keeps_service_artwork(
+    tmp_path: Any,
+    provider_domain: str,
+    skip_provider_playlists: bool,
+    service_image_types: set[ImageType],
+    expected_types: set[ImageType],
+) -> None:
+    """Provider playlists should only get the image types their service does not supply."""
+    provider = _make_provider(tmp_path)
+    await provider.handle_async_init()
+    provider.config.get_value = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda key: {
+            CONF_LOG_LEVEL: "GLOBAL",
+            "template": "album_grid",
+            "skip_provider_playlists": skip_provider_playlists,
+        }.get(key)
+    )
+
+    playlist = _make_playlist(provider_domain)
+    # a playlist of the user's own (a builtin system playlist keeps its static artwork)
+    playlist.is_editable = True
+    service_images = [
+        MediaItemImage(
+            type=img_type,
+            path=f"https://example.com/{img_type.value}.jpg",
+            provider="test_provider",
+            remotely_accessible=True,
+        )
+        for img_type in service_image_types
+    ]
+    old_generated_images = [
+        MediaItemImage(
+            type=img_type,
+            path=os.path.join(
+                provider._images_dir, f"{playlist.item_id}_1234567890_{img_type.value}.jpg"
+            ),
+            provider="playlist_metadata",
+        )
+        for img_type in (ImageType.THUMB, ImageType.FANART)
+    ]
+    playlist.metadata.images = UniqueList([*service_images, *old_generated_images])
+
+    tracks = [
+        _make_track_with_image(f"track{i}", f"http://example.com/img{i}.jpg") for i in range(10)
+    ]
+
+    async def mock_tracks_iter(
+        _item_id: str,
+        _provider: str,
+        _force_refresh: bool = False,
+        _allow_dynamic_tracks: bool = False,
+    ) -> AsyncGenerator[Track]:
+        for track in tracks:
+            yield track
+
+    with (
+        patch.object(provider.mass.music.playlists, "iter_tracks", side_effect=mock_tracks_iter),
+        patch.object(provider, "_render", new_callable=AsyncMock) as mock_render,
+    ):
+        mock_render.return_value = b"fake_image_data"
+
+        result = await provider.get_playlist_metadata(playlist)
+
+    generated_types = {img.type for img in result.images or []} if result else set()
+    assert generated_types == expected_types
+    assert all(img in playlist.metadata.images for img in service_images)
+    # our previous images go once they are regenerated or the service supplies that type
+    for old_image in old_generated_images:
+        replaced = old_image.type in expected_types | service_image_types
+        assert (old_image in playlist.metadata.images) != replaced
 
 
 @pytest.mark.asyncio
@@ -199,11 +286,73 @@ async def test_get_playlist_metadata_handles_exception(
 
     # Mock _render to raise an exception
     with patch.object(provider, "_render", new_callable=AsyncMock) as mock_render:
-        mock_render.side_effect = RuntimeError("Rendering failed")
+        mock_render.side_effect = UnidentifiedImageError("Invalid cover image")
 
         result = await provider.get_playlist_metadata(playlist)
 
         assert result is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [FileNotFoundError, MusicAssistantError])
+async def test_album_grid_uses_remaining_cover_when_one_fails(
+    tmp_path: Path, error_type: type[Exception]
+) -> None:
+    """A missing image or provider error does not prevent rendering the other cover."""
+    provider = _make_provider(tmp_path)
+    with BytesIO() as source:
+        Image.new("RGB", (16, 16), "white").save(source, "PNG")
+        cover = source.getvalue()
+    images = [
+        MediaItemImage(type=ImageType.THUMB, path=path, provider="library")
+        for path in ("missing.jpg", "available.png")
+    ]
+
+    async def fetch_image(_mass: Any, path: str, _provider: str) -> bytes:
+        if path == "missing.jpg":
+            raise error_type(path)
+        return cover
+
+    with patch(
+        "music_assistant.providers.playlist_metadata.get_image_data", side_effect=fetch_image
+    ) as fetch:
+        result = await provider._render("album_grid", images)
+
+    assert fetch.await_count == 2
+    with Image.open(BytesIO(result)) as rendered:
+        assert rendered.getpixel((0, 0)) == (255, 255, 255)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_editable", [False, True])
+async def test_get_playlist_metadata_skips_builtin_system_playlists(
+    tmp_path: Any, is_editable: bool
+) -> None:
+    """Only an editable builtin playlist gets artwork, a system playlist keeps its static one."""
+    provider = _make_provider(tmp_path)
+    await provider.handle_async_init()
+    playlist = Playlist(
+        item_id="1",
+        provider="library",
+        name="Builtin Playlist",
+        provider_mappings={
+            ProviderMapping(
+                item_id="my_playlist", provider_domain="builtin", provider_instance="builtin"
+            )
+        },
+        is_editable=is_editable,
+    )
+    thumb = MediaItemImage(
+        type=ImageType.THUMB,
+        path=os.path.join(provider._images_dir, "1_thumb.jpg"),
+        provider="playlist_metadata",
+        remotely_accessible=False,
+    )
+
+    with patch.object(provider, "_generate_and_write", AsyncMock(return_value=thumb)):
+        result = await provider.get_playlist_metadata(playlist)
+
+    assert (result is not None) is is_editable
 
 
 @pytest.mark.asyncio
@@ -238,7 +387,7 @@ async def test_get_playlist_metadata_cleans_up_old_files(
             yield track
 
     with (
-        patch.object(provider.mass.music.playlists, "tracks", side_effect=mock_tracks_iter),
+        patch.object(provider.mass.music.playlists, "iter_tracks", side_effect=mock_tracks_iter),
         patch.object(provider, "_render", new_callable=AsyncMock) as mock_render,
     ):
         mock_render.return_value = b"new_image_data"
@@ -253,7 +402,7 @@ async def test_get_playlist_metadata_cleans_up_old_files(
         assert playlist.item_id in thumb_image.path
         assert "_thumb.jpg" in thumb_image.path
         # Old files are cleaned up asynchronously by _cleanup_stale_images, not inline here.
-        assert os.path.exists(thumb_image.path)
+        assert Path(thumb_image.path).exists()
 
 
 @pytest.mark.asyncio
@@ -280,7 +429,7 @@ async def test_get_playlist_metadata_always_creates_unique_filename(
             yield track
 
     with (
-        patch.object(provider.mass.music.playlists, "tracks", side_effect=mock_tracks_iter),
+        patch.object(provider.mass.music.playlists, "iter_tracks", side_effect=mock_tracks_iter),
         patch.object(provider, "_render", new_callable=AsyncMock) as mock_render,
     ):
         mock_render.return_value = b"new_image_data"
@@ -342,6 +491,79 @@ async def test_is_our_image_recognizes_own_images(
     )
     assert provider._is_our_image(builtin_asset) is False
 
+    # Cover file next to a filesystem playlist in a subfolder (relative path)
+    filesystem_cover = MediaItemImage(
+        type=ImageType.THUMB,
+        path="Playlists/My Playlist.png",
+        provider="filesystem_local--abc123",
+        remotely_accessible=False,
+    )
+    assert provider._is_our_image(filesystem_cover) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("relative_to_images_dir", [False, True])
+async def test_cleanup_old_playlist_images_keeps_files_outside_images_dir(
+    tmp_path: Any,
+    relative_to_images_dir: bool,
+) -> None:
+    """An image claiming our provider id must never delete a file outside our images dir."""
+    provider = _make_provider(tmp_path)
+    await provider.handle_async_init()
+
+    outside_file = tmp_path / "not_our_file.txt"
+    outside_file.write_bytes(b"keep me")
+    image_path = (
+        os.path.join(provider._images_dir, "..", outside_file.name)
+        if relative_to_images_dir
+        else str(outside_file)
+    )
+    playlist = _make_playlist()
+    playlist.metadata.images = UniqueList(
+        [
+            MediaItemImage(
+                type=ImageType.THUMB,
+                path=image_path,
+                provider="playlist_metadata",
+                remotely_accessible=False,
+            )
+        ]
+    )
+
+    await provider._cleanup_old_playlist_images(playlist, {ImageType.THUMB})
+
+    assert outside_file.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("store_absolute_path", [True, False])
+async def test_cleanup_old_playlist_images_removes_own_files(
+    tmp_path: Any,
+    store_absolute_path: bool,
+) -> None:
+    """Images we generated are deleted whether their path was stored absolute or as a name."""
+    provider = _make_provider(tmp_path)
+    await provider.handle_async_init()
+
+    own_file = Path(provider._images_dir) / "test_playlist_1_1234567890_thumb.jpg"
+    own_file.write_bytes(b"old_image_data")
+    playlist = _make_playlist()
+    playlist.metadata.images = UniqueList(
+        [
+            MediaItemImage(
+                type=ImageType.THUMB,
+                path=str(own_file) if store_absolute_path else own_file.name,
+                provider="playlist_metadata",
+                remotely_accessible=False,
+            )
+        ]
+    )
+
+    await provider._cleanup_old_playlist_images(playlist, {ImageType.THUMB})
+
+    assert not own_file.exists()
+    assert not playlist.metadata.images
+
 
 @pytest.mark.asyncio
 async def test_analyze_playlist_genres_returns_most_common_genres(
@@ -388,7 +610,7 @@ async def test_analyze_playlist_genres_returns_most_common_genres(
         for track in tracks:
             yield track
 
-    with patch.object(provider.mass.music.playlists, "tracks", side_effect=mock_tracks_iter):
+    with patch.object(provider.mass.music.playlists, "iter_tracks", side_effect=mock_tracks_iter):
         result = await provider._analyze_playlist_genres(playlist)
 
     assert result is not None
@@ -433,7 +655,7 @@ async def test_analyze_playlist_genres_respects_threshold(
         for track in tracks:
             yield track
 
-    with patch.object(provider.mass.music.playlists, "tracks", side_effect=mock_tracks_iter):
+    with patch.object(provider.mass.music.playlists, "iter_tracks", side_effect=mock_tracks_iter):
         result = await provider._analyze_playlist_genres(playlist)
 
     assert result is not None
@@ -467,7 +689,7 @@ async def test_analyze_playlist_genres_returns_none_for_empty_playlist(
         if False:  # pragma: no cover
             yield  # type: ignore[unreachable]
 
-    with patch.object(provider.mass.music.playlists, "tracks", side_effect=mock_tracks_iter):
+    with patch.object(provider.mass.music.playlists, "iter_tracks", side_effect=mock_tracks_iter):
         result = await provider._analyze_playlist_genres(playlist)
 
     assert result is None
@@ -507,7 +729,7 @@ async def test_analyze_playlist_genres_returns_none_when_no_genres_meet_threshol
         for track in tracks:
             yield track
 
-    with patch.object(provider.mass.music.playlists, "tracks", side_effect=mock_tracks_iter):
+    with patch.object(provider.mass.music.playlists, "iter_tracks", side_effect=mock_tracks_iter):
         result = await provider._analyze_playlist_genres(playlist)
 
     assert result is None
@@ -542,7 +764,7 @@ async def test_analyze_playlist_genres_handles_exception(
             yield  # type: ignore[unreachable]
         raise AttributeError("Failed to get tracks")
 
-    with patch.object(provider.mass.music.playlists, "tracks", side_effect=mock_tracks_iter):
+    with patch.object(provider.mass.music.playlists, "iter_tracks", side_effect=mock_tracks_iter):
         result = await provider._analyze_playlist_genres(playlist)
 
     assert result is None
@@ -590,7 +812,7 @@ async def test_get_playlist_metadata_includes_genres_when_enabled(
             yield track
 
     with (
-        patch.object(provider.mass.music.playlists, "tracks", side_effect=mock_tracks_iter),
+        patch.object(provider.mass.music.playlists, "iter_tracks", side_effect=mock_tracks_iter),
         patch.object(provider, "_render", new_callable=AsyncMock) as mock_render,
     ):
         mock_render.return_value = b"fake_image_data"
@@ -646,7 +868,7 @@ async def test_get_playlist_metadata_excludes_genres_when_disabled(
             yield track
 
     with (
-        patch.object(provider.mass.music.playlists, "tracks", side_effect=mock_tracks_iter),
+        patch.object(provider.mass.music.playlists, "iter_tracks", side_effect=mock_tracks_iter),
         patch.object(provider, "_render", new_callable=AsyncMock) as mock_render,
     ):
         mock_render.return_value = b"fake_image_data"

@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
-from typing import TYPE_CHECKING
-from unittest.mock import MagicMock
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from aiohttp.client_exceptions import ClientError
 from PIL import Image, ImageDraw
 
 from music_assistant.helpers import images
 from music_assistant.helpers.colors import (
+    _PALETTE_SOURCE_SIZE,
     _adjust_until_contrast,
     _contrast_ratio,
     _derive_palette,
@@ -21,10 +24,9 @@ from music_assistant.helpers.colors import (
     get_palette,
 )
 from music_assistant.helpers.images import invalidate_cached_image
+from tests.common import collect_loop_errors
 
 if TYPE_CHECKING:
-    import pytest
-
     from music_assistant.mass import MusicAssistant
 
 _MIN_CONTRAST = 4.5
@@ -108,7 +110,7 @@ def test_palette_invariants_over_random_candidates() -> None:
     """
     import random  # noqa: PLC0415
 
-    rng = random.Random(42)
+    rng = random.Random(42)  # noqa: S311 - test data
     # Calibrated for CI: 50 iterations runs in a few ms. Bump if invariants
     # regress and we need denser coverage.
     for _ in range(50):
@@ -138,6 +140,70 @@ def test_extract_palette_end_to_end() -> None:
     assert palette.primary is not None
     if palette.background_dark is not None:
         assert _contrast_ratio(palette.background_dark, (255, 255, 255)) >= _MIN_CONTRAST
+
+
+async def test_cancelled_caller_of_a_failing_extraction_logs_no_loop_error(
+    mass_minimal: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Palette extraction failing after its caller gave up is not reported to the loop handler."""
+    # mass_minimal constructs the cache controller without initializing it
+    cache_config = await mass_minimal.config.get_core_config(mass_minimal.cache.domain)
+    await mass_minimal.cache.setup(cache_config)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    extraction: list[asyncio.Task[Any]] = []
+
+    async def failing_source(
+        _mass: MusicAssistant, path_or_url: str, _size: int | None, _provider: str, **_: object
+    ) -> bytes:
+        current = asyncio.current_task()
+        assert current is not None
+        extraction.append(current)
+        entered.set()
+        await release.wait()
+        raise RuntimeError(f"Decoder crashed on {path_or_url}")
+
+    monkeypatch.setattr("music_assistant.helpers.colors.get_image_thumb", failing_source)
+    with collect_loop_errors() as reported:
+        caller = asyncio.create_task(get_palette(mass_minimal, "/some/image.png", "builtin"))
+        await entered.wait()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        # only fail the extraction once the cancellation is fully processed
+        release.set()
+        await asyncio.wait(extraction)
+
+    assert isinstance(extraction[0].exception(), RuntimeError)
+    assert reported == []
+
+
+async def test_palette_is_quantized_from_a_thumbnail(
+    mass_minimal: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The quantizer gets a bounded thumbnail, never the full-size artwork."""
+    # mass_minimal constructs the cache controller without initializing it
+    cache_config = await mass_minimal.config.get_core_config(mass_minimal.cache.domain)
+    await mass_minimal.cache.setup(cache_config)
+    thumb_bytes = _make_image_bytes([(200, 30, 30), (30, 30, 200)])
+    thumb = AsyncMock(return_value=thumb_bytes)
+    monkeypatch.setattr("music_assistant.helpers.colors.get_image_thumb", thumb)
+    quantized: list[bytes] = []
+
+    def recording_quantizer(image_bytes: bytes, **_: object) -> list[tuple[int, int, int]]:
+        quantized.append(image_bytes)
+        return [(200, 30, 30), (30, 30, 200)]
+
+    monkeypatch.setattr("music_assistant.helpers.colors._mmcq_palette", recording_quantizer)
+
+    palette = await get_palette(mass_minimal, "/some/huge/cover.jpg", "builtin")
+
+    assert palette is not None
+    assert palette.primary is not None
+    thumb.assert_awaited_once_with(
+        mass_minimal, "/some/huge/cover.jpg", _PALETTE_SOURCE_SIZE, "builtin", image_format="jpeg"
+    )
+    assert quantized == [thumb_bytes]
 
 
 async def test_get_palette_tolerates_unavailable_image(

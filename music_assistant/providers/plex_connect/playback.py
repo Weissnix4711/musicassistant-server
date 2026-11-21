@@ -48,8 +48,8 @@ class PlaybackMixin:
         if queue and queue.current_item:
             try:
                 await self.provider.mass.players.cmd_seek(player_id, offset // 1000)
-            except Exception as e:
-                LOGGER.debug(f"Could not seek to offset {offset}ms: {e}")
+            except Exception as e:  # noqa: BLE001 - player provider code, seeking is best effort
+                LOGGER.debug("Could not seek to offset %sms: %s", offset, e)
         else:
             LOGGER.warning("Queue not ready for seeking after timeout")
 
@@ -176,13 +176,15 @@ class PlaybackMixin:
 
                 if ma_index is None:
                     LOGGER.warning(
-                        f"Could not find MA queue index for play queue item ID: "
-                        f"{play_queue_item_id}"
+                        "Could not find MA queue index for play queue item ID: %s",
+                        play_queue_item_id,
                     )
                     return web.Response(status=404, text="Queue item not found")
 
                 LOGGER.info(
-                    f"Skipping to queue index {ma_index} (play queue item ID: {play_queue_item_id})"
+                    "Skipping to queue index %s (play queue item ID: %s)",
+                    ma_index,
+                    play_queue_item_id,
                 )
             else:
                 # Key is a library path — find track in MA queue by Plex key
@@ -196,17 +198,17 @@ class PlaybackMixin:
                         break
 
                 if ma_index is None:
-                    LOGGER.warning(f"Could not find track with key {key} in MA queue")
+                    LOGGER.warning("Could not find track with key %s in MA queue", key)
                     return web.Response(status=404, text="Track not found in queue")
 
-                LOGGER.info(f"Skipping to queue index {ma_index} (track key: {key})")
+                LOGGER.info("Skipping to queue index %s (track key: %s)", ma_index, key)
 
             await self.provider.mass.player_queues.play_index(self._ma_player_id, ma_index)
             await self._broadcast_timeline()
             return web.Response(status=200)
 
-        except Exception as e:
-            LOGGER.exception(f"Error handling skipTo: {e}")
+        except Exception:
+            LOGGER.exception("Error handling skipTo")
             return web.Response(status=500, text="Internal error")
         finally:
             self._updating_from_plex = False
@@ -234,11 +236,17 @@ class PlaybackMixin:
             if "repeat" in request.query:
                 repeat_value = int(request.query["repeat"])
                 if repeat_value == 0:
-                    self.provider.mass.player_queues.set_repeat(self._ma_player_id, RepeatMode.OFF)
+                    await self.provider.mass.player_queues.set_repeat(
+                        self._ma_player_id, RepeatMode.OFF
+                    )
                 elif repeat_value == 1:
-                    self.provider.mass.player_queues.set_repeat(self._ma_player_id, RepeatMode.ONE)
+                    await self.provider.mass.player_queues.set_repeat(
+                        self._ma_player_id, RepeatMode.ONE
+                    )
                 elif repeat_value == 2:
-                    self.provider.mass.player_queues.set_repeat(self._ma_player_id, RepeatMode.ALL)
+                    await self.provider.mass.player_queues.set_repeat(
+                        self._ma_player_id, RepeatMode.ALL
+                    )
 
             await self._broadcast_timeline()
         finally:

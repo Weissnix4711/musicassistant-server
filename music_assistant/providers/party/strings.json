@@ -29,16 +29,8 @@
     "guest_disabled_note": {
       "label": "Ready to get the party started? Enable guest access and let your friends add songs by scanning a QR code!"
     },
-    "action_enable_guest_access": {
-      "label": "Enable Guest Access",
-      "action_label": "Enable Guest Access"
-    },
     "guest_enabled_note": {
-      "label": "Guest mode is enabled. Guests will be able to join your party by scanning the QR code (which automatically expires after 8 hours unless configured otherwise). Click the button below to end the party and withdraw guest access."
-    },
-    "action_disable_guest_access": {
-      "label": "Disable Guest Access",
-      "action_label": "Disable Guest Access"
+      "label": "Guest mode is enabled. Guests will be able to join your party by scanning the QR code (which automatically expires after 8 hours unless configured otherwise). Switch the toggle off to end the party and withdraw guest access."
     },
     "qr_text": {
       "label": "QR Code Text",
@@ -107,6 +99,10 @@
     "skip_song_refill_minutes": {
       "label": "Skip Song Refill Rate (minutes)",
       "description": "How many minutes it takes for one 'Skip Song' token to refill. This controls how often guests can skip the currently playing song."
+    },
+    "skip_votes_required": {
+      "label": "Votes Required to Skip",
+      "description": "How many different guests must press 'Skip' before the currently playing song is skipped. Set to 1 to let a single guest skip a song. Votes reset when the next song starts."
     },
     "request_badge_color": {
       "label": "Request Badge Color",

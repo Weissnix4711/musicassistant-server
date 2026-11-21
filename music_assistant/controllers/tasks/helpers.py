@@ -158,6 +158,7 @@ def serialize_task_state(task: BackgroundTask) -> dict[str, Any]:
         "last_error": task.last_error,
         "failure_count": task.failure_count,
         "failure_messages": list(task.failure_messages),
+        "report": task.report,
         "schedule": serialize_task_schedule_state(task.schedule),
         "schedule_enabled": task.schedule.enabled if task.schedule else True,
     }
@@ -195,6 +196,8 @@ def restore_task_state(task: BackgroundTask, state: Mapping[str, Any]) -> None:
         task.failure_messages = [item for item in failure_messages if isinstance(item, str)]
     else:
         task.failure_messages = []
+
+    task.report = state.get("report") if isinstance(state.get("report"), str) else None
 
 
 def serialize_task_schedule_state(schedule: TaskSchedule | None) -> dict[str, Any] | None:
@@ -388,7 +391,7 @@ class TaskLogHandler(logging.Handler):
             return
         try:
             line = self.format(record)
-        except Exception:  # pragma: no cover - logging internals
+        except Exception:  # pragma: no cover - logging internals  # noqa: BLE001 - must never raise
             self.handleError(record)
             return
         self._mass.loop.call_soon_threadsafe(self._append_log, task_id, line)

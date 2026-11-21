@@ -5,7 +5,8 @@
   "name": "Tidal",
   "description": "Stream music, playlists, and exclusives in lossless FLAC quality.",
   "codeowners": ["@jozefKruszynski"],
-  "requirements": ["pkce==1.0.3"],
+  "provides": ["artist", "album", "track", "playlist"],
+  "requirements": [],
   "documentation": "https://music-assistant.io/music-providers/tidal/",
   "multi_instance": true
 }

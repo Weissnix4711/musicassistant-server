@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+from ipaddress import ip_address
 from typing import TYPE_CHECKING, cast
+from urllib.parse import urlparse
 
 from awesomeversion import AwesomeVersion
 from mashumaro import DataClassDictMixin
@@ -141,6 +143,26 @@ class RemoteAccessManager:
         """Return the current Remote ID."""
         return self._remote_id
 
+    def is_gateway_connection(
+        self, webrtc_session_id: str | None, peer_address: str | None
+    ) -> bool:
+        """
+        Return whether a websocket connection was opened by the gateway for a live session.
+
+        :param webrtc_session_id: The WebRTC session id the connection claims to belong to.
+        :param peer_address: The address the connection came from.
+        """
+        if self.gateway is None or not webrtc_session_id or not peer_address:
+            return False
+        # the gateway dials the address of its local websocket URL, so its connections come
+        # from that address, and it registers a session before it opens its connection
+        connect_address = urlparse(self.gateway.local_ws_url).hostname
+        try:
+            is_connect_address = ip_address(peer_address) == ip_address(connect_address or "")
+        except ValueError:
+            return False
+        return is_connect_address and webrtc_session_id in self.gateway.sessions
+
     def _schedule_start(self) -> None:
         """Schedule a debounced gateway restart."""
         self.mass.cancel_timer(TASK_ID_START_GATEWAY)
@@ -195,14 +217,9 @@ class RemoteAccessManager:
             self.mass.storage_path
         )
 
-        # resolved once, at gateway start: changing the base URL restarts neither the
-        # webserver nor this gateway, and behind a reverse proxy this address need not be
-        # reachable from this host at all
-        base_url = self.mass.webserver.base_url
-        local_ws_url = base_url.replace("http", "ws", 1)
-        if not local_ws_url.endswith("/"):
-            local_ws_url += "/"
-        local_ws_url += "ws"
+        # resolved once, at gateway start: this follows the webserver's bind address, which
+        # can only change through a reload of the webserver - and that restarts this gateway
+        local_ws_url = self.webserver.internal_base_url.replace("http", "ws", 1) + "/ws"
 
         ha_cloud_available, ice_servers = await self._get_ha_cloud_status()
         using_ha_cloud = bool(ha_cloud_available and ice_servers)
@@ -214,11 +231,6 @@ class RemoteAccessManager:
         mode = "optimized" if using_ha_cloud else "basic"
         self.logger.info("Starting remote access in %s mode", mode)
 
-        # resolved once, at gateway start: this follows the streams bind IP, while the socket
-        # behind it is only bound when the Sendspin provider loads, so the two can disagree
-        # either way and re-resolving per session would be no more reliable
-        sendspin_url = self.webserver.internal_sendspin_url
-
         gateway = WebRTCGateway(
             http_session=self.mass.http_session,
             remote_id=self._remote_id,
@@ -226,7 +238,7 @@ class RemoteAccessManager:
             key_pem=self._key_pem,
             signaling_url=SIGNALING_SERVER_URL,
             local_ws_url=local_ws_url,
-            sendspin_url=sendspin_url,
+            sendspin_url_callback=lambda: self.webserver.internal_sendspin_url,
             ice_servers=ice_servers,
             # Pass callback to get fresh ICE servers for each client connection
             # This ensures TURN credentials are always valid
@@ -303,8 +315,8 @@ class RemoteAccessManager:
                     hass_client.version,
                 )
             self.logger.debug("HA Cloud available but no ICE servers returned")
-        except Exception as err:
-            self.logger.exception("Error getting HA Cloud status: %s", err)
+        except Exception:
+            self.logger.exception("Error getting HA Cloud status")
         return False, None
 
     def _register_api_commands(self) -> None:

@@ -5,10 +5,11 @@
   "name": "AirPlay Receiver",
   "description": "Receive AirPlay audio streams and use them as a source in Music Assistant.",
   "codeowners": ["@music-assistant"],
+  "provides": ["audio_source"],
   "credits": [
     "[ShairPort Sync by Mike Brady](https://github.com/mikebrady/shairport-sync)"
   ],
   "documentation": "https://music-assistant.io/plugins/airplay-receiver/",
-  "multi_instance": true,
+  "multi_instance": false,
   "requirements": []
 }

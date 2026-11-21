@@ -17,20 +17,19 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING
 
+from aiohttp import ClientError
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import ConfigEntryType
 from music_assistant_models.errors import LoginFailed
 
+from music_assistant.constants import CONF_PASSWORD, CONF_USERNAME, CONF_VERIFY_SSL
 from music_assistant.models.setup_flow import SetupFlowError, StepExpiredError
 
 from . import (
     CONF_DEVICE_ID,
-    CONF_PASSWORD,
     CONF_TOKEN_NC,
     CONF_URL,
     CONF_URL_NC,
-    CONF_USERNAME,
-    CONF_VERIFY_SSL,
 )
 
 if TYPE_CHECKING:
@@ -77,7 +76,7 @@ async def run_setup(session: SetupSession) -> None:
 async def _run_gpodder(session: SetupSession) -> None:
     """Collect classic gpodder/opodsync credentials; finish validates them by loading."""
     prefill = session.context.setup_data
-    errors: dict[str, str] | None = None
+    errors: dict[str, str | SetupFlowError] | None = None
     while True:
         values = await session.form(
             [
@@ -118,13 +117,13 @@ async def _run_gpodder(session: SetupSession) -> None:
             await session.finish(collected)
             return
         except SetupFlowError as err:
-            errors = {"base": err.translation_key or str(err)}
+            errors = {"base": err}
 
 
 async def _run_nextcloud(session: SetupSession) -> None:
     """Run the Nextcloud Login Flow v2 (open URL + poll for the app password)."""
     prefill = session.context.setup_data
-    errors: dict[str, str] | None = None
+    errors: dict[str, str | SetupFlowError] | None = None
     while True:
         values = await session.form(
             [
@@ -151,25 +150,14 @@ async def _run_nextcloud(session: SetupSession) -> None:
             login_url, poll_endpoint, poll_token = await _nc_start(
                 session.mass.http_session, url_nc, verify_ssl
             )
-        except Exception:
+        except ClientError, TimeoutError, KeyError, TypeError, ValueError:
             errors = {"base": "not_a_nextcloud_instance"}
             continue
-        # surface the login URL (link icon) so the user can approve in Nextcloud
-        await session.form(
-            [
-                ConfigEntry(
-                    key="nc_approve",
-                    type=ConfigEntryType.LABEL,
-                    help_link=login_url,
-                )
-            ],
-            step_id="nc_approve",
-        )
         try:
-            app_password = await session.progress_until(
+            app_password = await session.external_until(
                 _nc_poll(session.mass.http_session, poll_endpoint, poll_token, verify_ssl),
-                step_id="nc_polling",
-                text="waiting_for_approval",
+                url=login_url,
+                step_id="nc_approve",
                 expires_in=_NC_LOGIN_TIMEOUT,
             )
         except StepExpiredError:
@@ -187,13 +175,14 @@ async def _run_nextcloud(session: SetupSession) -> None:
             await session.finish(collected)
             return
         except SetupFlowError as err:
-            errors = {"base": err.translation_key or str(err)}
+            errors = {"base": err}
 
 
 async def _nc_start(session: ClientSession, url_nc: str, verify_ssl: bool) -> tuple[str, str, str]:
     """Start the Nextcloud Login Flow v2, returning (login_url, poll_endpoint, poll_token)."""
     async with session.post(
         url_nc.rstrip("/") + "/index.php/login/v2",
+        # Nextcloud shows the user agent as the app name on its login page (#5010)
         headers={"User-Agent": "Music Assistant"},
         ssl=verify_ssl,
     ) as response:

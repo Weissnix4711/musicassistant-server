@@ -1,12 +1,11 @@
 """
 Smart Fades - vocal-activity contract and vocal-collision math.
 
-Parses the optional 1800-bin ``vocal_activity`` list stored in
-``AudioAnalysisData.extra_data``, turns it into hysteresis-gated vocal windows,
-and scores how much two tracks' vocals would collide inside a candidate
-crossfade. Every function here works over plain floats and lists - no NumPy -
-so a missing or malformed timeline never pulls it onto a path that would
-otherwise stay numpy-free.
+Parses the optional 1800-bin ``AudioAnalysisData.vocal_activity`` list, turns
+it into hysteresis-gated vocal windows, and scores how much two tracks'
+vocals would collide inside a candidate crossfade. Every function here works
+over plain floats and lists - no NumPy - so a missing or malformed timeline
+never pulls it onto a path that would otherwise stay numpy-free.
 """
 
 from __future__ import annotations
@@ -38,6 +37,11 @@ MIN_VOCAL_RUN = 0.3
 # inside the same phrase rather than a real gap between two of them
 MIN_VOCAL_GAP = 0.5
 MAX_VOCAL_GAP = 1.0
+# Sustained-evidence gate: a run only becomes a window when its peak OR its
+# mean shows real confidence; weak short runs are backing 'aahhs'/detector
+# noise, and a window here can veto an entire 8-bar blend downstream
+VOCAL_MIN_RUN_PEAK = 0.85
+VOCAL_MIN_RUN_MEAN = 0.65
 
 # Two-sided vocal-collision guard, in rendered-crossfade seconds. Collisions
 # are scored on UNPADDED windows (padding is silence, not vocal), and the
@@ -85,7 +89,11 @@ class VocalMask:
 
 @dataclass(frozen=True, slots=True)
 class VocalHysteresisConfig:
-    """Tunable hysteresis/padding/gap-bridging thresholds for ``build_vocal_windows``."""
+    """
+    Tunable hysteresis/padding/gap-bridging thresholds for ``build_vocal_windows``.
+
+    A run also needs a confident peak or mean probability to survive as a window.
+    """
 
     open_threshold: float = VOCAL_OPEN_THRESHOLD
     close_threshold: float = VOCAL_CLOSE_THRESHOLD
@@ -94,9 +102,13 @@ class VocalHysteresisConfig:
     min_run: float = MIN_VOCAL_RUN
     min_gap: float = MIN_VOCAL_GAP
     max_gap: float = MAX_VOCAL_GAP
+    min_run_peak: float = VOCAL_MIN_RUN_PEAK
+    min_run_mean: float = VOCAL_MIN_RUN_MEAN
 
 
 DEFAULT_VOCAL_CONFIG = VocalHysteresisConfig()
+# retention keeps audio, so it wants recall; only the planner's veto needs the gate
+PROTECTIVE_VOCAL_CONFIG = VocalHysteresisConfig(min_run_peak=0.0, min_run_mean=0.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,8 +123,8 @@ def parse_vocal_probabilities(analysis: AudioAnalysisData) -> VocalTimeline | No
     """
     Validate and return the stored 1800-bin vocal-activity timeline.
 
-    Returns ``None`` when ``extra_data["vocal_activity"]`` is absent or fails
-    any part of the contract: it is not a list of exactly 1800 finite numeric
+    Returns ``None`` when ``vocal_activity`` is absent or fails any part of
+    the contract: it is not a list of exactly 1800 finite numeric
     probabilities in the inclusive range 0..1, or the analysis has no finite
     positive duration. Callers must treat that as "vocal-aware logic is
     unavailable for this track".
@@ -127,7 +139,7 @@ def parse_vocal_probabilities(analysis: AudioAnalysisData) -> VocalTimeline | No
         or duration <= 0.0
     ):
         return None
-    vocal_activity = (analysis.extra_data or {}).get("vocal_activity")
+    vocal_activity = analysis.vocal_activity
     if not isinstance(vocal_activity, list) or len(vocal_activity) != VOCAL_ACTIVITY_BINS:
         return None
     values: list[float] = []
@@ -161,8 +173,9 @@ def build_vocal_windows(
     A run opens once probability reaches ``config.open_threshold`` and only
     closes once it drops below ``config.close_threshold``, then gets padded
     left/right and bridged across short gaps so one phrase doesn't fragment
-    into several windows. Probabilities are indexed from the same time origin
-    as ``start_s``/``end_s``; windows outside that range are dropped.
+    into several windows - and dropped if it never reaches a confident peak
+    or mean. Probabilities are indexed from the same time origin as
+    ``start_s``/``end_s``; windows outside that range are dropped.
 
     :param probabilities: Validated per-bin vocal probabilities (0..1).
     :param frame_duration: Seconds spanned by each probability bin.
@@ -191,11 +204,14 @@ def build_vocal_windows(
         1,
         math.ceil(math.nextafter(config.min_run / frame_duration, -math.inf)),
     )
-    timed_runs = [
-        (left * frame_duration, right * frame_duration)
-        for left, right in runs
-        if right - left >= min_run_frames
-    ]
+    timed_runs: list[tuple[float, float]] = []
+    for run_start_frame, run_end_frame in runs:
+        if run_end_frame - run_start_frame < min_run_frames:
+            continue
+        run = probabilities[run_start_frame:run_end_frame]
+        if max(run) < config.min_run_peak and sum(run) / len(run) < config.min_run_mean:
+            continue
+        timed_runs.append((run_start_frame * frame_duration, run_end_frame * frame_duration))
 
     gap = min(config.max_gap, max(config.min_gap, beat_duration or config.min_gap))
     windows: list[tuple[float, float]] = []
@@ -209,6 +225,27 @@ def build_vocal_windows(
         else:
             windows.append((padded_left, padded_right))
     return VocalMask(windows=windows)
+
+
+def first_vocal_onset(analysis: AudioAnalysisData) -> float | None:
+    """
+    Return the second at which singing starts, or None when it cannot be told.
+
+    :param analysis: Stored analysis row to read the vocal-activity timeline from.
+    """
+    if (timeline := parse_vocal_probabilities(analysis)) is None:
+        return None
+    assert analysis.duration is not None  # guaranteed by the validated timeline
+    mask = build_vocal_windows(
+        timeline.probabilities,
+        timeline.frame_duration,
+        0.0,
+        analysis.duration,
+        beat_duration=60.0 / analysis.bpm if analysis.bpm and analysis.bpm > 0.0 else None,
+        # a weak run counts: a voice placed over singing costs more than one cut short
+        config=PROTECTIVE_VOCAL_CONFIG,
+    )
+    return mask.windows[0][0] if mask.windows else None
 
 
 def mask_saturated(mask: VocalMask, span: float) -> bool:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -36,9 +37,10 @@ def _create_plugin(instance_id: str, ai_ids: list[str], tts_ids: list[str]) -> M
     return provider
 
 
-def _create_mass(*plugins: MagicMock) -> MagicMock:
+def _create_mass(*plugins: MagicMock, locale: str = "en_US") -> MagicMock:
     """Create a mock MusicAssistant serving the given plugins for the engine features."""
     mass = MagicMock()
+    mass.metadata = SimpleNamespace(locale=locale)
 
     def _providers(feature: ProviderFeature, priority: Any = ()) -> list[MagicMock]:  # noqa: ARG001
         if feature == ProviderFeature.AI_QUERY:
@@ -92,32 +94,67 @@ async def test_setup_collects_both_engines() -> None:
 
     task = asyncio.create_task(setup_flow.run_setup(session))
     step = await _wait_for_form(session)
-    assert [entry.key for entry in step.entries] == ["ai_engine", "tts_engine"]
-    assert [option.value for option in step.entries[0].options] == ["hass--1/ai_task.a"]
+    assert [entry.key for entry in step.entries] == [
+        "ai_engine",
+        "tts_engine",
+        "weather_city",
+        "weather_country",
+    ]
+    # the first option follows the default engine, which is what a picker starts on
+    assert [option.value for option in step.entries[0].options] == [
+        "global",
+        "hass--1/ai_task.a",
+    ]
+    assert step.entries[0].default_value == "global"
     assert (
         session.handle_submit({"ai_engine": "hass--1/ai_task.a", "tts_engine": "hass--1/tts.a"})
         is None
     )
     await task
 
-    assert collected == {"ai_engine": "hass--1/ai_task.a", "tts_engine": "hass--1/tts.a"}
+    assert collected == {
+        "ai_engine": "hass--1/ai_task.a",
+        "tts_engine": "hass--1/tts.a",
+        "weather_city": "",
+        "weather_country": "US",
+    }
 
 
-async def test_setup_rejects_a_submission_without_a_choice() -> None:
-    """Both engines are mandatory, so an empty submission re-shows the form with an error."""
+async def test_setup_offers_the_weather_location() -> None:
+    """A city/country submitted at setup is persisted alongside the engine picks."""
     mass = _create_mass(_create_plugin("hass--1", ["ai_task.a"], ["tts.a"]))
     collected: dict[str, Any] = {}
     session = _create_session(mass, collected)
 
     task = asyncio.create_task(setup_flow.run_setup(session))
     await _wait_for_form(session)
-    step = session.handle_submit({})
-    assert step is not None
-    assert step.errors
-    assert not collected
-
-    session.handle_submit({"ai_engine": "hass--1/ai_task.a", "tts_engine": "hass--1/tts.a"})
+    session.handle_submit(
+        {
+            "ai_engine": "hass--1/ai_task.a",
+            "tts_engine": "hass--1/tts.a",
+            "weather_city": "Amsterdam",
+            "weather_country": "NL",
+        }
+    )
     await task
+
+    assert collected["weather_city"] == "Amsterdam"
+    assert collected["weather_country"] == "NL"
+
+
+async def test_setup_without_a_choice_follows_the_default_engines() -> None:
+    """Both engines are mandatory, which the default engines satisfy without a pick."""
+    mass = _create_mass(_create_plugin("hass--1", ["ai_task.a"], ["tts.a"]))
+    collected: dict[str, Any] = {}
+    session = _create_session(mass, collected)
+
+    task = asyncio.create_task(setup_flow.run_setup(session))
+    await _wait_for_form(session)
+    assert session.handle_submit({}) is None
+    await task
+
+    assert collected["ai_engine"] == "global"
+    assert collected["tts_engine"] == "global"
 
 
 async def test_setup_prefills_the_previous_selection() -> None:

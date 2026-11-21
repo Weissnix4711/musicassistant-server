@@ -3,30 +3,43 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from http import HTTPStatus
 from math import ceil
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
-from hass_client.exceptions import BaseHassClientError
-from music_assistant_models.enums import ProviderFeature
-from music_assistant_models.errors import SetupFailedError, UnsupportedFeaturedException
+from aiohttp import ClientResponseError
+from hass_client.exceptions import BaseHassClientError, FailedCommand, NotConnected
+from multidict import CIMultiDict
+from music_assistant_models.enums import EventType, ProviderFeature
+from music_assistant_models.errors import (
+    MusicAssistantError,
+    ProviderUnavailableError,
+    RateLimited,
+    SetupFailedError,
+    UnsupportedFeaturedException,
+)
 
-from music_assistant.constants import CONF_LOG_LEVEL
+from music_assistant.constants import CONF_LOG_LEVEL, CONF_VERIFY_SSL
+from music_assistant.helpers.tts import TTSLanguageNotSupportedError
 from music_assistant.providers.hass import (
     CONF_AUTH_TOKEN,
-    CONF_MUTE_CONTROLS,
-    CONF_POWER_CONTROLS,
     CONF_URL,
-    CONF_VERIFY_SSL,
-    CONF_VOLUME_CONTROLS,
     STATE_FETCH_BATCH_SIZE,
+    HassRegistryEntity,
     HomeAssistantProvider,
     setup,
 )
-from music_assistant.providers.hass.constants import MediaPlayerEntityFeature
+from music_assistant.providers.hass.constants import (
+    CONF_MUTE_CONTROLS,
+    CONF_POWER_CONTROLS,
+    CONF_VOLUME_CONTROLS,
+)
+from tests.common import use_real_create_task
 
 LAST_CHANGED = 1683832716.072648
 LAST_CHANGED_ISO = "2023-05-11T19:18:36.072648+00:00"
@@ -113,12 +126,13 @@ def _mass() -> MagicMock:
     mass.cache = _Cache()
     mass.http_session = MagicMock()
     mass.http_session_no_ssl = MagicMock()
-    mass.create_task.side_effect = asyncio.create_task
+    use_real_create_task(mass)
     mass.players.register_or_update_player_control = AsyncMock()
     # get_setup_value reads the (empty, here) live setup_data blob from the store, then
     # falls through to the provider config mock's get_value for the persisted test values
     mass.config.get = MagicMock(return_value={})
     mass.config.get_raw_provider_config_value = MagicMock(return_value=None)
+    mass.metadata.locale = "en_US"
     return mass
 
 
@@ -132,6 +146,7 @@ class _HomeAssistantClient:
         listener_error: Exception | None = None,
         connect_error: Exception | None = None,
         block_registry: bool = False,
+        tts_languages: dict[str, list[str]] | None = None,
     ) -> None:
         self.connected = False
         self.disconnected = False
@@ -156,6 +171,9 @@ class _HomeAssistantClient:
         self.disabled_entities: set[str] = set()
         # devices as returned in full by the device registry listing
         self.devices: list[dict[str, Any]] = []
+        # supported languages per tts entity as listed by tts/engine/list, which fails
+        # (as on a Home Assistant without the command) when None
+        self.tts_languages = tts_languages
         # events delivered ahead of a subscription's initial state message
         self.leading_events: list[dict[str, Any]] = []
         self.deliver_initial_states = True
@@ -165,6 +183,8 @@ class _HomeAssistantClient:
         self._registry_result = (
             asyncio.get_running_loop().create_future() if block_registry else None
         )
+        # resolve this to make an already running listener return, as a lost connection does
+        self.connection_lost: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self.send_command = AsyncMock(side_effect=self._send_command)
 
     async def connect(self) -> None:
@@ -175,13 +195,13 @@ class _HomeAssistantClient:
         self.connected = True
 
     async def start_listening(self) -> None:
-        """Listen until the provider stops the listener task."""
+        """Listen until the connection is lost or the provider stops the listener task."""
         self.calls.append("start_listening")
         self.listener_started.set()
         try:
             if self._listener_error:
                 raise self._listener_error
-            await asyncio.Event().wait()
+            await self.connection_lost
         except asyncio.CancelledError:
             self.listener_cancelled.set()
             raise
@@ -255,6 +275,15 @@ class _HomeAssistantClient:
         self.calls.append(command)
         if command == REGISTRY_ENTRIES_COMMAND:
             return self._registry_entries(cast("list[str]", kwargs["entity_ids"]))
+        if command == "tts/engine/list":
+            if self.tts_languages is None:
+                raise FailedCommand("Unknown command.")
+            return {
+                "providers": [
+                    {"engine_id": entity_id, "supported_languages": languages}
+                    for entity_id, languages in self.tts_languages.items()
+                ]
+            }
         return {"response": {"data": "answer"}}
 
     async def _registry_for_display(self) -> dict[str, Any]:
@@ -301,10 +330,19 @@ class _HomeAssistantClient:
 
 @asynccontextmanager
 async def _start_provider(
-    states: list[dict[str, Any]], **config_values: Any
+    states: list[dict[str, Any]],
+    tts_languages: dict[str, list[str]] | None = None,
+    /,
+    **config_values: Any,
 ) -> AsyncIterator[tuple[HomeAssistantProvider, _HomeAssistantClient]]:
-    """Start the provider with a connected mocked Home Assistant client."""
-    hass = _HomeAssistantClient(states)
+    """
+    Start the provider with a connected mocked Home Assistant client.
+
+    :param states: The entity states Home Assistant reports.
+    :param tts_languages: The supported languages per tts entity, for tts/engine/list.
+    :param config_values: Provider config values overriding the test defaults.
+    """
+    hass = _HomeAssistantClient(states, tts_languages=tts_languages)
     mass = _mass()
     manifest = MagicMock()
     manifest.domain = "hass"
@@ -328,15 +366,58 @@ async def _wait_for_stored(provider: HomeAssistantProvider) -> None:
             await asyncio.sleep(0)
 
 
+def _hold_back_registry_fetch(hass: _HomeAssistantClient) -> asyncio.Future[None]:
+    """Hold back the next registry listing and return the future that releases it."""
+    registry_response: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    hass._registry_result = registry_response
+    # the startup fetch left the event set, so re-arm it for the fetch under test
+    hass.registry_started.clear()
+    return registry_response
+
+
+async def _wait_for_registry_fetch(hass: _HomeAssistantClient) -> None:
+    """Wait until the held back registry listing is in flight."""
+    async with asyncio.timeout(1):
+        await hass.registry_started.wait()
+
+
+def _registry_event(
+    entity_id: str, action: str = "update", changes: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Return the data Home Assistant sends in an entity_registry_updated event."""
+    data: dict[str, Any] = {"action": action, "entity_id": entity_id}
+    if action == "update":
+        # an update carries the old value of every field it touched
+        data["changes"] = changes or {}
+    return data
+
+
 async def _fire_registry_update(
-    provider: HomeAssistantProvider, hass: _HomeAssistantClient, entity_id: str
+    provider: HomeAssistantProvider,
+    hass: _HomeAssistantClient,
+    entity_id: str,
+    action: str,
 ) -> None:
     """Deliver an entity registry update and wait for the engine rebuild it schedules."""
     with patch("music_assistant.providers.hass.ENGINE_REFRESH_DEBOUNCE", 0):
-        hass.fire_event("entity_registry_updated", {"action": "update", "entity_id": entity_id})
+        hass.fire_event("entity_registry_updated", _registry_event(entity_id, action))
         assert provider._engine_refresh_task is not None
         async with asyncio.timeout(1):
             await provider._engine_refresh_task
+
+
+def _providers_updated_events(provider: HomeAssistantProvider) -> list[Any]:
+    """
+    Return the PROVIDERS_UPDATED events the provider signalled so far.
+
+    :param provider: The provider whose Music Assistant mock is inspected.
+    """
+    signal_event = cast("MagicMock", provider.mass.signal_event)
+    return [
+        call
+        for call in signal_event.call_args_list
+        if call.args[:1] == (EventType.PROVIDERS_UPDATED,)
+    ]
 
 
 async def test_feature_resolution_starts_listener_first() -> None:
@@ -509,6 +590,40 @@ async def test_connection_failure_cleans_up_client() -> None:
     assert provider._listen_task is None
 
 
+async def test_lost_connection_arms_the_reconnect_under_the_load_task_id() -> None:
+    """A lost connection arms the reconnect so a (re)load starting first cancels it."""
+    async with _start_provider([]) as (provider, hass):
+        mass = cast("MagicMock", provider.mass)
+        mass.call_later.reset_mock()
+        assert provider._listen_task is not None
+
+        hass.connection_lost.set_exception(BaseHassClientError("connection lost"))
+        async with asyncio.timeout(1):
+            await provider._listen_task
+
+        assert provider.available is False
+        retry = mass.call_later.call_args
+        assert retry.args == (5, mass.load_provider, "hass--test")
+        assert retry.kwargs == {"allow_retry": True, "task_id": "load_provider_hass--test"}
+
+
+async def test_unexpected_listener_error_still_arms_the_reconnect() -> None:
+    """A listener crash on an error the client does not wrap still arms the reconnect."""
+    async with _start_provider([]) as (provider, hass):
+        mass = cast("MagicMock", provider.mass)
+        mass.call_later.reset_mock()
+        assert provider._listen_task is not None
+
+        hass.connection_lost.set_exception(AttributeError("unexpected"))
+        async with asyncio.timeout(1):
+            await provider._listen_task
+
+        assert provider.available is False
+        retry = mass.call_later.call_args
+        assert retry.args == (5, mass.load_provider, "hass--test")
+        assert retry.kwargs == {"allow_retry": True, "task_id": "load_provider_hass--test"}
+
+
 async def test_engines_are_listed_for_every_feature_entity() -> None:
     """Expose every Home Assistant TTS and AI Task entity as an engine."""
     states = [
@@ -587,11 +702,273 @@ async def test_ai_query_not_advertised_without_entity() -> None:
             await provider.ai_query("What is this song?")
 
 
+async def test_only_ai_tasks_that_generate_images_become_image_engines() -> None:
+    """Offer an AI Task entity for image generation only when it advertises that feature."""
+    states = [
+        _image_state("ai_task.images", "Images", supported_features=1 | 4),
+        _image_state("ai_task.text_only", "Text", supported_features=1),
+        _image_state("ai_task.broken", "Broken", supported_features="4"),
+        _state("ai_task.no_features", "None"),
+        _image_state("tts.piper", "Piper", supported_features=4),
+    ]
+
+    async with _start_provider(states) as (provider, _):
+        image_engines = await provider.get_image_engines()
+
+        assert [engine.id for engine in image_engines] == ["ai_task.images"]
+        assert image_engines[0].uid == "hass--test/ai_task.images"
+        # every ai_task entity stays a text engine, as before
+        assert len(await provider.get_ai_engines()) == 4
+
+
+async def test_an_image_only_ai_task_still_advertises_ai_query() -> None:
+    """Image engines are collected from AI_QUERY plugins, so they must declare it."""
+    states = [_image_state("ai_task.images", "Images", supported_features=4)]
+
+    async with _start_provider(states) as (provider, _):
+        assert ProviderFeature.AI_QUERY in provider.supported_features
+
+
+async def test_ai_generate_image_downloads_the_returned_image() -> None:
+    """Generate via ai_task.generate_image and fetch the signed URL it answers with."""
+    states = [_image_state("ai_task.images", "Images", supported_features=4)]
+
+    async with _start_provider(states) as (provider, hass):
+        hass.send_command = AsyncMock(
+            return_value={"response": {"url": "/ai_task/image/x.png?authSig=abc"}}
+        )
+        with patch.object(provider, "_fetch_image", AsyncMock(return_value=b"png")) as fetch_image:
+            assert await provider.ai_generate_image("A sunset") == b"png"
+
+        hass.send_command.assert_awaited_once_with(
+            "call_service",
+            domain="ai_task",
+            service="generate_image",
+            service_data={
+                "task_name": ANY,
+                "instructions": "A sunset",
+                "entity_id": "ai_task.images",
+            },
+            return_response=True,
+        )
+        fetch_image.assert_awaited_once_with("/ai_task/image/x.png?authSig=abc")
+
+
+async def test_ai_generate_image_uses_a_task_name_per_image() -> None:
+    """Images generated at the same time get their own task name, so HA stores both."""
+    states = [_image_state("ai_task.images", "Images", supported_features=4)]
+
+    async with _start_provider(states) as (provider, hass):
+        hass.send_command = AsyncMock(
+            return_value={"response": {"url": "/ai_task/image/x.png?authSig=abc"}}
+        )
+        with patch.object(provider, "_fetch_image", AsyncMock(return_value=b"png")):
+            await asyncio.gather(provider.ai_generate_image("A"), provider.ai_generate_image("B"))
+
+        task_names = {
+            call.kwargs["service_data"]["task_name"] for call in hass.send_command.await_args_list
+        }
+        assert len(task_names) == 2
+        assert all(name.startswith("music_assistant_") for name in task_names)
+
+
+async def test_ai_generate_image_fetches_an_absolute_url_from_the_connected_instance() -> None:
+    """An image URL prefixed with Home Assistant's own URL is fetched by its signed path."""
+    states = [_image_state("ai_task.images", "Images", supported_features=4)]
+
+    async with _start_provider(states) as (provider, hass):
+        hass.send_command = AsyncMock(
+            return_value={
+                "response": {"url": "https://ha.example.com/ai_task/image/x.png?authSig=abc"}
+            }
+        )
+        with patch.object(provider, "_fetch_image", AsyncMock(return_value=b"png")) as fetch_image:
+            await provider.ai_generate_image("A sunset")
+
+        fetch_image.assert_awaited_once_with("/ai_task/image/x.png?authSig=abc")
+
+
+async def test_ai_generate_image_is_fetched_although_not_an_entity_picture() -> None:
+    """The generated image is fetched, while resolve_image keeps refusing its path."""
+    states = [_image_state("ai_task.images", "Images", supported_features=4)]
+
+    async with _start_provider(states) as (provider, hass):
+        hass.send_command = AsyncMock(
+            return_value={"response": {"url": "/ai_task/image/x.png?authSig=abc"}}
+        )
+        get = _mock_image_response(provider, [b"png"], content_type="image/png")
+
+        assert await provider.ai_generate_image("A sunset") == b"png"
+        with pytest.raises(FileNotFoundError):
+            await provider.resolve_image("/ai_task/image/x.png?authSig=abc")
+
+        get.assert_called_once_with(
+            "http://homeassistant.local:8123/ai_task/image/x.png?authSig=abc",
+            headers={"Authorization": "Bearer token"},
+        )
+
+
+async def test_ai_generate_image_keeps_the_signature_out_of_errors() -> None:
+    """A failed or unexpected image link never puts its signed query in the error."""
+    states = [_image_state("ai_task.images", "Images", supported_features=4)]
+
+    async with _start_provider(states) as (provider, hass):
+        hass.send_command = AsyncMock(
+            return_value={"response": {"url": "/api/elsewhere/x.png?authSig=secret"}}
+        )
+        with pytest.raises(MusicAssistantError) as unexpected:
+            await provider.ai_generate_image("A sunset")
+
+        hass.send_command = AsyncMock(
+            return_value={"response": {"url": "/ai_task/image/x.png?authSig=secret"}}
+        )
+        failed = ClientResponseError(
+            MagicMock(real_url="http://ha/ai_task/image/x.png?authSig=secret"),
+            (),
+            status=403,
+            message="Forbidden",
+        )
+        with (
+            patch.object(provider, "_fetch_image", AsyncMock(side_effect=failed)),
+            pytest.raises(MusicAssistantError) as forbidden,
+        ):
+            await provider.ai_generate_image("A sunset")
+
+    assert "secret" not in str(unexpected.value)
+    assert "403" in str(forbidden.value)
+    assert "secret" not in str(forbidden.value)
+    assert forbidden.value.__cause__ is None
+    assert not isinstance(forbidden.value, ProviderUnavailableError)
+
+
+@pytest.mark.parametrize("status", [408, 500, 503])
+async def test_ai_generate_image_reports_a_failing_image_download_as_unavailable(
+    status: int,
+) -> None:
+    """Home Assistant failing to hand out the image is an outage, without the signature."""
+    states = [_image_state("ai_task.images", "Images", supported_features=4)]
+
+    async with _start_provider(states) as (provider, hass):
+        hass.send_command = AsyncMock(
+            return_value={"response": {"url": "/ai_task/image/x.png?authSig=secret"}}
+        )
+        failed = ClientResponseError(
+            MagicMock(real_url="http://ha/ai_task/image/x.png?authSig=secret"),
+            (),
+            status=status,
+            message="Unavailable",
+        )
+        with (
+            patch.object(provider, "_fetch_image", AsyncMock(side_effect=failed)),
+            pytest.raises(ProviderUnavailableError) as unavailable,
+        ):
+            await provider.ai_generate_image("A sunset")
+
+    assert str(status) in str(unavailable.value)
+    assert "secret" not in str(unavailable.value)
+    assert unavailable.value.__cause__ is None
+
+
+async def test_ai_generate_image_reports_a_rate_limited_image_download() -> None:
+    """Home Assistant rate limiting the image is reported with its wait, without the signature."""
+    states = [_image_state("ai_task.images", "Images", supported_features=4)]
+
+    async with _start_provider(states) as (provider, hass):
+        hass.send_command = AsyncMock(
+            return_value={"response": {"url": "/ai_task/image/x.png?authSig=secret"}}
+        )
+        failed = ClientResponseError(
+            MagicMock(real_url="http://ha/ai_task/image/x.png?authSig=secret"),
+            (),
+            status=429,
+            message="Too Many Requests",
+            headers=CIMultiDict({"Retry-After": "120"}),
+        )
+        with (
+            patch.object(provider, "_fetch_image", AsyncMock(side_effect=failed)),
+            pytest.raises(RateLimited) as limited,
+        ):
+            await provider.ai_generate_image("A sunset")
+
+    assert limited.value.backoff_time == 120
+    assert "secret" not in str(limited.value)
+    assert limited.value.__cause__ is None
+
+
+async def test_ai_generate_image_refuses_a_link_outside_the_ai_task_images() -> None:
+    """Only the path Home Assistant serves generated images from is fetched."""
+    states = [_image_state("ai_task.images", "Images", supported_features=4)]
+
+    async with _start_provider(states) as (provider, hass):
+        hass.send_command = AsyncMock(return_value={"response": {"url": "/api/states"}})
+        with (
+            patch.object(provider, "_fetch_image", AsyncMock()) as fetch_image,
+            pytest.raises(MusicAssistantError),
+        ):
+            await provider.ai_generate_image("A sunset")
+
+        fetch_image.assert_not_awaited()
+
+
+async def test_ai_generate_image_reports_an_unreachable_home_assistant() -> None:
+    """A lost connection is reported as unavailable, not as a failed generation."""
+    states = [_image_state("ai_task.images", "Images", supported_features=4)]
+
+    async with _start_provider(states) as (provider, hass):
+        hass.send_command = AsyncMock(side_effect=NotConnected("gone"))
+
+        with pytest.raises(ProviderUnavailableError):
+            await provider.ai_generate_image("A sunset")
+
+
+async def test_ai_generate_image_raises_without_an_image() -> None:
+    """A response without an image URL is an error, not empty image data."""
+    states = [_image_state("ai_task.images", "Images", supported_features=4)]
+
+    async with _start_provider(states) as (provider, hass):
+        hass.send_command = AsyncMock(return_value={"response": {}})
+
+        with pytest.raises(MusicAssistantError):
+            await provider.ai_generate_image("A sunset")
+
+
+async def test_ai_generate_image_raises_without_an_image_engine() -> None:
+    """Refuse to generate images when no AI Task entity supports it."""
+    async with _start_provider([_state("ai_task.text", "Text")]) as (provider, _):
+        with pytest.raises(UnsupportedFeaturedException):
+            await provider.ai_generate_image("A sunset")
+
+
+def _image_state(entity_id: str, friendly_name: str, *, supported_features: Any) -> dict[str, Any]:
+    """Return a Home Assistant entity state that reports the given supported_features."""
+    state = _state(entity_id, friendly_name)
+    state["attributes"]["supported_features"] = supported_features
+    return state
+
+
 def _mock_tts_response(provider: HomeAssistantProvider) -> MagicMock:
     """Let the Home Assistant tts_get_url endpoint return a URL and return the post mock."""
     response = AsyncMock()
+    response.ok = True
     response.raise_for_status = MagicMock()
     response.json.return_value = {"url": "http://homeassistant.local/tts.mp3"}
+    post = cast("MagicMock", provider.mass.http_session.post)
+    post.return_value.__aenter__.return_value = response
+    return post
+
+
+def _mock_tts_error_response(
+    provider: HomeAssistantProvider, error_message: str | None, status: int = 400
+) -> MagicMock:
+    """Let the tts_get_url endpoint fail with the given status and HA error body."""
+    response = AsyncMock()
+    response.ok = False
+    response.status = status
+    response.reason = HTTPStatus(status).phrase
+    if error_message is None:
+        response.json.side_effect = ValueError("not json")
+    else:
+        response.json.return_value = {"error": error_message}
     post = cast("MagicMock", provider.mass.http_session.post)
     post.return_value.__aenter__.return_value = response
     return post
@@ -614,6 +991,21 @@ async def test_tts_uses_the_first_engine_by_default() -> None:
         assert request.kwargs["json"] == {"engine_id": "tts.first", "message": "Hello"}
 
 
+@pytest.mark.parametrize("verify_ssl", [True, False])
+async def test_tts_clip_follows_the_ssl_verification_setting(verify_ssl: bool) -> None:
+    """The clip's certificate is verified only when the provider verifies SSL."""
+    async with _start_provider([_state("tts.first", "First")], **{CONF_VERIFY_SSL: verify_ssl}) as (
+        provider,
+        _,
+    ):
+        provider.mass.running_as_hass_addon = False
+        _mock_tts_response(provider)
+
+        stream = await provider.get_tts_message("Hello")
+
+        assert stream.verify_ssl is verify_ssl
+
+
 async def test_tts_uses_the_requested_engine() -> None:
     """Render speech on the requested engine."""
     states = [_state("tts.first", "First"), _state("tts.second", "Second")]
@@ -628,11 +1020,246 @@ async def test_tts_uses_the_requested_engine() -> None:
 
 async def test_tts_not_advertised_without_entity() -> None:
     """Do not advertise TTS when Home Assistant has no TTS entity."""
-    async with _start_provider([_state("sensor.example", "Example")]) as (provider, _):
+    async with _start_provider([_state("sensor.example", "Example")]) as (provider, hass):
         assert ProviderFeature.TTS not in provider.supported_features
 
+        assert "tts/engine/list" not in hass.calls
         with pytest.raises(UnsupportedFeaturedException):
             await provider.get_tts_message("Hello")
+
+
+async def test_tts_sends_options_in_the_payload() -> None:
+    """A host's TTS options are forwarded in the tts_get_url payload."""
+    async with _start_provider([_state("tts.first", "First")]) as (provider, _):
+        post = _mock_tts_response(provider)
+
+        await provider.get_tts_message(
+            "Hello", options={"voice": "en_US-lessac-medium", "length_scale": 1.2}
+        )
+
+        assert post.call_args.kwargs["json"] == {
+            "engine_id": "tts.first",
+            "message": "Hello",
+            "options": {"voice": "en_US-lessac-medium", "length_scale": 1.2},
+        }
+
+
+async def test_tts_omits_options_from_the_payload_when_empty() -> None:
+    """An empty options dict is not sent to Home Assistant."""
+    async with _start_provider([_state("tts.first", "First")]) as (provider, _):
+        post = _mock_tts_response(provider)
+
+        await provider.get_tts_message("Hello", options={})
+
+        assert post.call_args.kwargs["json"] == {"engine_id": "tts.first", "message": "Hello"}
+
+
+async def test_tts_engine_languages_are_read_once_per_refresh() -> None:
+    """Read the engines' languages when the engines are listed, never per request."""
+    states = [_state("tts.cloud", "Cloud"), _state("tts.piper", "Piper")]
+    languages = {"tts.cloud": ["nl-NL"], "tts.piper": ["nl_NL"]}
+
+    async with _start_provider(states, languages) as (provider, hass):
+        assert hass.calls.count("tts/engine/list") == 1
+        _mock_tts_response(provider)
+
+        await provider.get_tts_message("Hallo", language="nl", engine_id="tts.cloud")
+        await provider.get_tts_message("Hallo", language="nl", engine_id="tts.piper")
+
+        assert hass.calls.count("tts/engine/list") == 1
+
+
+async def test_tts_bare_language_is_sent_as_the_engines_regional_code() -> None:
+    """A bare language code is sent as the regional variant the engine lists for it."""
+    languages = {"tts.cloud": ["en-US", "nl-BE", "nl-NL"]}
+
+    async with _start_provider([_state("tts.cloud", "Cloud")], languages) as (provider, _):
+        post = _mock_tts_response(provider)
+
+        await provider.get_tts_message("Hallo", language="nl")
+
+        assert post.call_args.kwargs["json"]["language"] == "nl-NL"
+
+
+async def test_tts_bare_language_prefers_the_server_locales_region() -> None:
+    """A bare language code picks the regional variant of the server locale when listed."""
+    languages = {"tts.cloud": ["en-GB", "en-US"]}
+
+    async with _start_provider([_state("tts.cloud", "Cloud")], languages) as (provider, _):
+        cast("MagicMock", provider.mass.metadata).locale = "en_GB"
+        post = _mock_tts_response(provider)
+
+        await provider.get_tts_message("Hello", language="en")
+
+        assert post.call_args.kwargs["json"]["language"] == "en-GB"
+
+
+async def test_tts_regional_language_is_sent_in_the_engines_spelling() -> None:
+    """A regional code is sent spelled the way the engine lists it."""
+    languages = {"tts.piper": ["en_US", "nl_NL"]}
+
+    async with _start_provider([_state("tts.piper", "Piper")], languages) as (provider, _):
+        post = _mock_tts_response(provider)
+
+        await provider.get_tts_message("Hallo", language="nl-NL")
+
+        assert post.call_args.kwargs["json"]["language"] == "nl_NL"
+
+
+async def test_tts_unknown_language_is_left_out_of_the_payload() -> None:
+    """A language the engine lacks is left out, so the engine speaks in its default."""
+    languages = {"tts.cloud": ["en-US", "nl-NL"]}
+
+    async with _start_provider([_state("tts.cloud", "Cloud")], languages) as (provider, _):
+        post = _mock_tts_response(provider)
+
+        await provider.get_tts_message("Hello", language="xx")
+
+        assert post.call_args.kwargs["json"] == {"engine_id": "tts.cloud", "message": "Hello"}
+
+
+async def test_tts_language_passes_through_when_the_languages_cannot_be_read() -> None:
+    """An engine whose languages could not be read gets the requested language unchanged."""
+    async with _start_provider([_state("tts.first", "First")]) as (provider, hass):
+        assert "tts/engine/list" in hass.calls
+        post = _mock_tts_response(provider)
+
+        await provider.get_tts_message("Hallo", language="nl")
+
+        assert post.call_args.kwargs["json"]["language"] == "nl"
+
+
+async def test_tts_invalid_option_raises_music_assistant_error() -> None:
+    """HA rejecting an unknown TTS option surfaces as MusicAssistantError with HA's message."""
+    async with _start_provider([_state("tts.first", "First")]) as (provider, _):
+        _mock_tts_error_response(provider, "Invalid options found: ['speaking_cadance']")
+
+        with pytest.raises(MusicAssistantError, match=r"Invalid options found"):
+            await provider.get_tts_message("Hello", options={"speaking_cadance": 1})
+
+
+async def test_tts_error_body_that_is_not_json_still_raises_the_generic_way() -> None:
+    """An unparsable error body raises the generic error naming the endpoint and status."""
+    async with _start_provider([_state("tts.first", "First")]) as (provider, _):
+        _mock_tts_error_response(provider, None, status=400)
+
+        with pytest.raises(MusicAssistantError, match=r"tts_get_url") as excinfo:
+            await provider.get_tts_message("Hello", options={"x": 1})
+
+        assert "400" in str(excinfo.value)
+
+
+async def test_tts_unsupported_language_raises_typed_error() -> None:
+    """An unsupported-language 400 raises the typed error naming the language."""
+    async with _start_provider([_state("tts.first", "First")]) as (provider, _):
+        _mock_tts_error_response(provider, "Language 'xx' not supported")
+
+        with pytest.raises(TTSLanguageNotSupportedError, match=r"'xx'"):
+            await provider.get_tts_message("Hello", language="xx")
+
+
+async def test_tts_bare_500_with_language_is_classified_as_possible_language_rejection() -> None:
+    """A bare 500 (HA's masked validation failure) with a language is a possible rejection."""
+    async with _start_provider([_state("tts.first", "First")]) as (provider, _):
+        _mock_tts_error_response(provider, None, status=500)
+
+        with pytest.raises(TTSLanguageNotSupportedError) as excinfo:
+            await provider.get_tts_message("Hello", language="en-US")
+
+        assert "500" in str(excinfo.value)
+        assert "possibly" in str(excinfo.value)
+
+
+async def test_tts_401_points_at_the_access_token() -> None:
+    """An auth failure points at the connection settings instead of the core log."""
+    async with _start_provider([_state("tts.first", "First")]) as (provider, _):
+        _mock_tts_error_response(provider, None, status=401)
+
+        with pytest.raises(MusicAssistantError) as excinfo:
+            await provider.get_tts_message("Hello", language="en-US")
+
+        assert not isinstance(excinfo.value, TTSLanguageNotSupportedError)
+        assert "401 (Unauthorized)" in str(excinfo.value)
+        assert "access token" in str(excinfo.value)
+
+
+async def test_tts_bare_503_with_language_raises_generic_error() -> None:
+    """A bodyless 5xx other than 500 is an outage, not a masked validation error."""
+    async with _start_provider([_state("tts.first", "First")]) as (provider, _):
+        _mock_tts_error_response(provider, None, status=503)
+
+        with pytest.raises(MusicAssistantError) as excinfo:
+            await provider.get_tts_message("Hello", language="en-US")
+
+        assert not isinstance(excinfo.value, TTSLanguageNotSupportedError)
+        assert "503" in str(excinfo.value)
+
+
+async def test_tts_bare_500_without_language_raises_generic_error() -> None:
+    """A bare 500 with no language requested has nothing to blame on a rejection."""
+    async with _start_provider([_state("tts.first", "First")]) as (provider, _):
+        _mock_tts_error_response(provider, None, status=500)
+
+        with pytest.raises(MusicAssistantError) as excinfo:
+            await provider.get_tts_message("Hello")
+
+        assert not isinstance(excinfo.value, TTSLanguageNotSupportedError)
+        assert "tts_get_url" in str(excinfo.value)
+        assert "500" in str(excinfo.value)
+
+
+def _mock_image_response(
+    provider: HomeAssistantProvider, chunks: list[bytes], content_type: str = "image/jpeg"
+) -> MagicMock:
+    """Let Home Assistant answer an image request with the given body and return the get mock."""
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.content_type = content_type
+    response.content_length = None
+    response.content.read = AsyncMock(side_effect=[*chunks, b""])
+    get = cast("MagicMock", provider.mass.http_session.get)
+    get.return_value.__aenter__.return_value = response
+    return get
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/media_player_proxy/media_player.kitchen?token=abc&cache=123",
+        "/local/cover..jpg?v=1..2",
+    ],
+)
+async def test_resolve_image_fetches_an_entity_picture_with_the_token(path: str) -> None:
+    """An entity picture path is fetched from Home Assistant with the access token."""
+    async with _start_provider([_state("sensor.example", "Example")]) as (provider, _):
+        get = _mock_image_response(provider, [b"\xff\xd8", b"jpeg"])
+
+        assert await provider.resolve_image(path) == b"\xff\xd8jpeg"
+
+        get.assert_called_once_with(
+            f"http://homeassistant.local:8123{path}",
+            headers={"Authorization": "Bearer token"},
+        )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/states",
+        "/api/media_player_proxy/../states",
+        "/api/media_player_proxy/%2e%2e/states",
+        "api/media_player_proxy/media_player.kitchen",
+    ],
+)
+async def test_resolve_image_rejects_paths_outside_the_image_endpoints(path: str) -> None:
+    """A path that is not an HA image endpoint is refused before anything is requested."""
+    async with _start_provider([_state("sensor.example", "Example")]) as (provider, _):
+        get = _mock_image_response(provider, [b"{}"])
+
+        with pytest.raises(FileNotFoundError):
+            await provider.resolve_image(path)
+
+        get.assert_not_called()
 
 
 async def test_registry_update_refreshes_the_engines() -> None:
@@ -642,7 +1269,7 @@ async def test_registry_update_refreshes_the_engines() -> None:
         assert ProviderFeature.TTS not in provider.supported_features
 
         hass.compressed_states["tts.new"] = _compressed(_state("tts.new", "New"))
-        await _fire_registry_update(provider, hass, "tts.new")
+        await _fire_registry_update(provider, hass, "tts.new", "create")
 
         assert [engine.id for engine in await provider.get_tts_engines()] == ["tts.new"]
         assert ProviderFeature.TTS in provider.supported_features
@@ -657,7 +1284,7 @@ async def test_registry_update_discards_the_feature_of_a_removed_engine() -> Non
         assert ProviderFeature.TTS in provider.supported_features
 
         del hass.compressed_states["tts.only"]
-        await _fire_registry_update(provider, hass, "tts.only")
+        await _fire_registry_update(provider, hass, "tts.only", "remove")
 
         assert await provider.get_tts_engines() == []
         assert ProviderFeature.TTS not in provider.supported_features
@@ -665,16 +1292,142 @@ async def test_registry_update_discards_the_feature_of_a_removed_engine() -> Non
         assert ProviderFeature.AI_QUERY in provider.supported_features
 
 
+async def test_changed_engines_notify_the_consumers_once() -> None:
+    """Announce a refresh that changed the engine lists with a single PROVIDERS_UPDATED."""
+    states = [_state("tts.only", "Only"), _state("ai_task.only", "Only")]
+
+    async with _start_provider(states) as (provider, hass):
+        await provider.loaded_in_mass()
+        mass = cast("MagicMock", provider.mass)
+        mass.signal_event.reset_mock()
+
+        del hass.compressed_states["tts.only"]
+        await _fire_registry_update(provider, hass, "tts.only", "remove")
+
+        events = _providers_updated_events(provider)
+        assert len(events) == 1
+        assert events[0].kwargs["data"] is mass.providers
+
+
+async def test_a_lost_ai_engine_notifies_the_consumers() -> None:
+    """Announce a vanished AI engine, the selection AI Radio depends on."""
+    states = [_state("tts.only", "Only"), _state("ai_task.only", "Only")]
+
+    async with _start_provider(states) as (provider, hass):
+        await provider.loaded_in_mass()
+        cast("MagicMock", provider.mass).signal_event.reset_mock()
+
+        del hass.compressed_states["ai_task.only"]
+        await _fire_registry_update(provider, hass, "ai_task.only", "remove")
+
+        assert await provider.get_ai_engines() == []
+        assert [engine.id for engine in await provider.get_tts_engines()] == ["tts.only"]
+        assert len(_providers_updated_events(provider)) == 1
+
+
+async def test_engines_are_in_place_before_the_consumers_are_told() -> None:
+    """Expose the rebuilt engine lists before signalling, as consumers read them at once."""
+    states = [_state("tts.only", "Only"), _state("ai_task.only", "Only")]
+
+    async with _start_provider(states) as (provider, hass):
+        await provider.loaded_in_mass()
+        signal_event = cast("MagicMock", provider.mass.signal_event)
+        signal_event.reset_mock()
+        engines_when_told: list[list[str]] = []
+        signal_event.side_effect = lambda *_args, **_kwargs: engines_when_told.append(
+            [engine.id for engine in provider._tts_engines]
+        )
+
+        del hass.compressed_states["tts.only"]
+        await _fire_registry_update(provider, hass, "tts.only", "remove")
+
+        assert engines_when_told == [[]]
+
+
+async def test_unchanged_engines_do_not_notify_the_consumers() -> None:
+    """Stay silent when a refresh rebuilds the very same engine lists."""
+    states = [_state("tts.only", "Only"), _state("ai_task.only", "Only")]
+
+    async with _start_provider(states) as (provider, hass):
+        await provider.loaded_in_mass()
+        cast("MagicMock", provider.mass).signal_event.reset_mock()
+
+        # registry churn that leaves the feature entities as they are, as in a rename of
+        # an entity that the engine name does not depend on
+        await _fire_registry_update(provider, hass, "tts.only", "update")
+
+        assert [engine.id for engine in await provider.get_tts_engines()] == ["tts.only"]
+        assert [engine.id for engine in await provider.get_ai_engines()] == ["ai_task.only"]
+        assert _providers_updated_events(provider) == []
+
+
+async def test_startup_refresh_does_not_notify_the_consumers() -> None:
+    """Leave the announcement of the engines found during startup to the load path."""
+    states = [_state("tts.only", "Only"), _state("ai_task.only", "Only")]
+
+    async with _start_provider(states) as (provider, _):
+        # the refresh that filled the empty lists ran before startup was marked complete
+        assert provider._startup_complete
+        assert [engine.id for engine in await provider.get_tts_engines()] == ["tts.only"]
+        assert _providers_updated_events(provider) == []
+
+
+async def test_refresh_tracks_engines_and_features_in_both_directions() -> None:
+    """Follow the engine lists and their features as feature entities appear and vanish."""
+    async with _start_provider([_state("sensor.example", "Example")]) as (provider, hass):
+        await provider.loaded_in_mass()
+        cast("MagicMock", provider.mass).signal_event.reset_mock()
+        assert ProviderFeature.TTS not in provider.supported_features
+        assert ProviderFeature.AI_QUERY not in provider.supported_features
+
+        hass.compressed_states["tts.new"] = _compressed(_state("tts.new", "New TTS"))
+        hass.compressed_states["ai_task.new"] = _compressed(_state("ai_task.new", "New AI"))
+        await _fire_registry_update(provider, hass, "tts.new", "create")
+
+        assert [engine.id for engine in await provider.get_tts_engines()] == ["tts.new"]
+        assert [engine.id for engine in await provider.get_ai_engines()] == ["ai_task.new"]
+        assert ProviderFeature.TTS in provider.supported_features
+        assert ProviderFeature.AI_QUERY in provider.supported_features
+
+        del hass.compressed_states["tts.new"]
+        del hass.compressed_states["ai_task.new"]
+        await _fire_registry_update(provider, hass, "tts.new", "remove")
+
+        assert await provider.get_tts_engines() == []
+        assert await provider.get_ai_engines() == []
+        assert ProviderFeature.TTS not in provider.supported_features
+        assert ProviderFeature.AI_QUERY not in provider.supported_features
+        assert len(_providers_updated_events(provider)) == 2
+
+
 async def test_registry_update_of_another_domain_is_ignored() -> None:
     """Ignore registry updates for entities that cannot back a feature."""
     async with _start_provider([_state("tts.only", "Only")]) as (provider, hass):
         await provider.loaded_in_mass()
 
-        hass.fire_event(
-            "entity_registry_updated", {"action": "create", "entity_id": "light.kitchen"}
-        )
+        hass.fire_event("entity_registry_updated", _registry_event("light.kitchen", "create"))
 
         assert provider._engine_refresh_task is None
+
+
+async def test_registry_update_of_a_feature_entity_refreshes_without_a_refetch() -> None:
+    """Rebuild the engine lists for a renamed feature entity without refetching the registry."""
+    async with _start_provider([_state("tts.only", "Only")]) as (provider, hass):
+        await provider.loaded_in_mass()
+        registry = await provider.get_entity_registry()
+        hass.compressed_states["tts.only"] = _compressed(_state("tts.only", "Renamed"))
+
+        with patch("music_assistant.providers.hass.ENGINE_REFRESH_DEBOUNCE", 0):
+            hass.fire_event(
+                "entity_registry_updated", _registry_event("tts.only", changes={"name": "Only"})
+            )
+            assert provider._engine_refresh_task is not None
+            async with asyncio.timeout(1):
+                await provider._engine_refresh_task
+
+        engines = await provider.get_tts_engines()
+        assert [engine.name for engine in engines] == ["Renamed (tts.only)"]
+        assert provider._entity_registry is registry
 
 
 async def test_burst_of_registry_updates_triggers_a_single_refresh() -> None:
@@ -686,8 +1439,7 @@ async def test_burst_of_registry_updates_triggers_a_single_refresh() -> None:
         with patch("music_assistant.providers.hass.ENGINE_REFRESH_DEBOUNCE", 0.05):
             for index in range(3):
                 hass.fire_event(
-                    "entity_registry_updated",
-                    {"action": "create", "entity_id": f"tts.new_{index}"},
+                    "entity_registry_updated", _registry_event(f"tts.new_{index}", "create")
                 )
             assert provider._engine_refresh_task is not None
             async with asyncio.timeout(1):
@@ -697,20 +1449,96 @@ async def test_burst_of_registry_updates_triggers_a_single_refresh() -> None:
 
 
 async def test_registry_update_of_another_domain_invalidates_the_registry() -> None:
-    """Refresh the cached registry for a registry update of any domain."""
+    """Refresh the cached registry for an entity that appeared in any domain."""
     async with _start_provider([_state("tts.only", "Only")]) as (provider, hass):
         registry_fetches = hass.calls.count(REGISTRY_LIST_COMMAND)
         hass.compressed_states["light.kitchen"] = _compressed(_state("light.kitchen", "Kitchen"))
 
-        hass.fire_event(
-            "entity_registry_updated", {"action": "create", "entity_id": "light.kitchen"}
-        )
+        hass.fire_event("entity_registry_updated", _registry_event("light.kitchen", "create"))
 
         # an entity that can not back a feature must not trigger an engine rebuild
         assert provider._engine_refresh_task is None
         result = await provider.get_states(domains=("light",))
         assert [state["entity_id"] for state in result] == ["light.kitchen"]
         assert hass.calls.count(REGISTRY_LIST_COMMAND) == registry_fetches + 1
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        pytest.param({"name": "Old name"}, id="rename"),
+        pytest.param({"icon": None}, id="icon"),
+        pytest.param({"labels": []}, id="labels"),
+        pytest.param({"hidden_by": None}, id="hidden"),
+        # an integration reload re-registers its entities, which touches these
+        pytest.param({"capabilities": None, "supported_features": 0}, id="reload"),
+    ],
+)
+async def test_registry_update_of_unmirrored_fields_keeps_the_registry(
+    changes: dict[str, Any],
+) -> None:
+    """Keep the mirrored registry for an update that cannot change what it holds."""
+    async with _start_provider([_state("tts.only", "Only")]) as (provider, hass):
+        registry = await provider.get_entity_registry()
+        registry_fetches = hass.calls.count(REGISTRY_LIST_COMMAND)
+
+        hass.fire_event(
+            "entity_registry_updated", _registry_event("light.kitchen", changes=changes)
+        )
+
+        assert await provider.get_entity_registry() is registry
+        assert hass.calls.count(REGISTRY_LIST_COMMAND) == registry_fetches
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        pytest.param({"entity_id": "light.old"}, id="entity_id"),
+        pytest.param({"platform": "old_platform"}, id="platform"),
+        pytest.param({"device_id": None}, id="device_id"),
+        pytest.param({"area_id": None}, id="area_id"),
+        # the listing omits disabled entities, so this one enters or leaves it
+        pytest.param({"disabled_by": None}, id="disabled_by"),
+        # a device rename reports no changed fields at all
+        pytest.param({}, id="changes_empty"),
+        # a move to another config entry can silently re-enable the entity
+        pytest.param({"config_entry_id": "other"}, id="config_entry_id"),
+    ],
+)
+async def test_registry_update_of_mirrored_fields_invalidates_the_registry(
+    changes: dict[str, Any],
+) -> None:
+    """Refetch the mirrored registry for an update that can change what it holds."""
+    async with _start_provider([_state("tts.only", "Only")]) as (provider, hass):
+        await provider.get_entity_registry()
+        registry_fetches = hass.calls.count(REGISTRY_LIST_COMMAND)
+
+        hass.fire_event(
+            "entity_registry_updated", _registry_event("light.kitchen", changes=changes)
+        )
+
+        assert provider._entity_registry is None
+        await provider.get_entity_registry()
+        assert hass.calls.count(REGISTRY_LIST_COMMAND) == registry_fetches + 1
+
+
+async def test_unmirrored_change_during_the_fetch_is_still_cached() -> None:
+    """Cache a registry listing that only an irrelevant registry update raced."""
+    async with _start_provider([_state("tts.only", "Only")]) as (provider, hass):
+        provider._entity_registry = None
+        # hold back the registry response until the update has been delivered
+        registry_response = _hold_back_registry_fetch(hass)
+        lookup = asyncio.ensure_future(provider.get_states(domains=("tts",)))
+        await _wait_for_registry_fetch(hass)
+
+        hass.fire_event(
+            "entity_registry_updated", _registry_event("light.kitchen", changes={"name": "Old"})
+        )
+        registry_response.set_result(None)
+        async with asyncio.timeout(1):
+            await lookup
+
+        assert provider._entity_registry is not None
 
 
 async def test_domains_are_resolved_through_the_display_registry() -> None:
@@ -740,13 +1568,13 @@ async def test_concurrent_domain_lookups_share_one_registry_fetch() -> None:
         registry_fetches = hass.calls.count(REGISTRY_LIST_COMMAND)
         provider._entity_registry = None
         # hold back the registry response until both lookups are waiting for it
-        hass._registry_result = asyncio.get_running_loop().create_future()
+        registry_response = _hold_back_registry_fetch(hass)
 
         lookups = asyncio.gather(
             provider.get_states(domains=("tts",)), provider.get_states(domains=("tts",))
         )
-        await asyncio.sleep(0)
-        hass._registry_result.set_result(None)
+        await _wait_for_registry_fetch(hass)
+        registry_response.set_result(None)
         async with asyncio.timeout(1):
             results = await lookups
 
@@ -759,14 +1587,12 @@ async def test_registry_changed_during_the_fetch_is_not_cached() -> None:
     async with _start_provider([_state("tts.only", "Only")]) as (provider, hass):
         provider._entity_registry = None
         # hold back the registry response until the update has been delivered
-        hass._registry_result = asyncio.get_running_loop().create_future()
+        registry_response = _hold_back_registry_fetch(hass)
         lookup = asyncio.ensure_future(provider.get_states(domains=("tts",)))
-        await asyncio.sleep(0)
+        await _wait_for_registry_fetch(hass)
 
-        hass.fire_event(
-            "entity_registry_updated", {"action": "create", "entity_id": "light.kitchen"}
-        )
-        hass._registry_result.set_result(None)
+        hass.fire_event("entity_registry_updated", _registry_event("light.kitchen", "create"))
+        registry_response.set_result(None)
         async with asyncio.timeout(1):
             await lookup
 
@@ -774,6 +1600,72 @@ async def test_registry_changed_during_the_fetch_is_not_cached() -> None:
         registry_fetches = hass.calls.count(REGISTRY_LIST_COMMAND)
         await provider.get_states(domains=("tts",))
         assert hass.calls.count(REGISTRY_LIST_COMMAND) == registry_fetches + 1
+
+
+async def test_shared_registry_rejects_writes() -> None:
+    """Reject writes to the registry (and its entries) shared between all callers."""
+    async with _start_provider([_state("tts.only", "Only")]) as (provider, _):
+        registry = await provider.get_entity_registry()
+
+        with pytest.raises(TypeError):
+            registry["light.kitchen"] = HassRegistryEntity(  # type: ignore[index]
+                platform="test", device_id=None, area_id=None
+            )
+        with pytest.raises(AttributeError):
+            registry["tts.only"].platform = "test"  # type: ignore[misc]
+
+
+async def test_registry_reuses_repeated_strings() -> None:
+    """Hold on to a single string object per distinct platform, device id and area id."""
+    async with _start_provider([_state("tts.only", "Only")]) as (provider, _):
+        # decode the listing like a real response, so the repeated platform, device id and
+        # area id arrive as distinct string objects instead of shared literals
+        entities = json.loads(
+            json.dumps(
+                [
+                    {
+                        "ei": f"light.lamp_{index}",
+                        "pl": "esphome",
+                        "di": "device",
+                        "ai": "area",
+                    }
+                    for index in range(3)
+                ]
+            )
+        )
+        with patch.object(
+            provider.hass, "send_command", AsyncMock(return_value={"entities": entities})
+        ):
+            registry = await provider._fetch_entity_registry()
+
+        assert len(registry) == 3
+        assert registry["light.lamp_0"] == HassRegistryEntity(
+            platform="esphome", device_id="device", area_id="area"
+        )
+        assert len({id(entry.platform) for entry in registry.values()}) == 1
+        assert len({id(entry.device_id) for entry in registry.values()}) == 1
+        assert len({id(entry.area_id) for entry in registry.values()}) == 1
+
+
+async def test_registry_leaves_out_the_device_and_area_it_is_not_told_about() -> None:
+    """Report no device or area for the entities whose listing entry omits them."""
+    async with _start_provider([_state("tts.only", "Only")]) as (provider, _):
+        entities = [
+            {"ei": "light.full", "pl": "esphome", "di": "device", "ai": "area"},
+            {"ei": "light.bare", "pl": "esphome"},
+            {"ei": "light.device_only", "pl": "esphome", "di": "other_device"},
+        ]
+        with patch.object(
+            provider.hass, "send_command", AsyncMock(return_value={"entities": entities})
+        ):
+            registry = await provider._fetch_entity_registry()
+
+        assert registry["light.bare"] == HassRegistryEntity(
+            platform="esphome", device_id=None, area_id=None
+        )
+        assert registry["light.device_only"] == HassRegistryEntity(
+            platform="esphome", device_id="other_device", area_id=None
+        )
 
 
 async def test_device_registry_is_reused_within_the_cache_window() -> None:
@@ -846,7 +1738,8 @@ async def test_disabled_entity_is_never_requested() -> None:
         # Home Assistant omits disabled entities from the registry, their state remains
         hass.disabled_entities.add("media_player.spare")
         hass.fire_event(
-            "entity_registry_updated", {"action": "update", "entity_id": "media_player.spare"}
+            "entity_registry_updated",
+            _registry_event("media_player.spare", changes={"disabled_by": None}),
         )
         hass.subscriptions.clear()
 
@@ -897,58 +1790,33 @@ async def test_entity_registry_subscription_is_replaced() -> None:
         assert hass.active_event_subscriptions == 0
 
 
-async def test_config_entries_survive_a_state_fetch_timeout() -> None:
-    """A Home Assistant too slow to list its entities yields entries without options."""
+async def test_config_entries_do_not_read_home_assistant() -> None:
+    """Build the config entries without asking Home Assistant for anything."""
     async with _start_provider([_state("switch.example", "Example")]) as (provider, _):
-        # the entity sweep only runs for a provider the load machinery marked available
         provider.available = True
-        with patch.object(provider, "get_states", AsyncMock(side_effect=TimeoutError)):
+        with patch.object(provider, "get_states", AsyncMock()) as get_states:
             entries = await provider.get_config_entries()
 
-    keys = {entry.key for entry in entries}
-    assert CONF_POWER_CONTROLS in keys
-    assert all(not entry.options for entry in entries)
+    get_states.assert_not_awaited()
+    assert CONF_POWER_CONTROLS in {entry.key for entry in entries}
 
 
-async def test_config_entries_list_entities_as_options() -> None:
-    """A responsive Home Assistant offers its entities as player control options."""
+async def test_config_entries_offer_the_control_lists_without_options() -> None:
+    """Offer the control lists as plain entity id lists, filled in by the entity picker."""
     async with _start_provider([_state("switch.example", "Example")]) as (provider, _):
         provider.available = True
         entries = await provider.get_config_entries()
 
-    power_controls = next(entry for entry in entries if entry.key == CONF_POWER_CONTROLS)
-    assert [option.value for option in power_controls.options] == ["switch.example"]
-
-
-async def test_config_entries_survive_an_entity_with_invalid_features() -> None:
-    """An entity reporting an uninterpretable supported_features value is skipped."""
-    broken = {
-        "entity_id": "media_player.new_receiver",
-        "state": "idle",
-        "attributes": {"friendly_name": "New Receiver", "supported_features": []},
-    }
-    usable = {
-        "entity_id": "media_player.old_receiver",
-        "state": "idle",
-        "attributes": {
-            "friendly_name": "Old Receiver",
-            "supported_features": int(
-                MediaPlayerEntityFeature.TURN_ON
-                | MediaPlayerEntityFeature.TURN_OFF
-                | MediaPlayerEntityFeature.VOLUME_SET
-            ),
-        },
-    }
-
-    async with _start_provider([broken, usable]) as (provider, _):
-        provider.available = True
-        entries = await provider.get_config_entries()
-
-    options_by_key = {entry.key: entry.options for entry in entries}
-    for key in (CONF_POWER_CONTROLS, CONF_VOLUME_CONTROLS):
-        assert [option.value for option in options_by_key[key] or ()] == [
-            "media_player.old_receiver"
-        ]
+    control_entries = [
+        entry
+        for entry in entries
+        if entry.key in (CONF_POWER_CONTROLS, CONF_VOLUME_CONTROLS, CONF_MUTE_CONTROLS)
+    ]
+    assert len(control_entries) == 3
+    for entry in control_entries:
+        assert entry.options == []
+        assert entry.multi_value is True
+        assert entry.immediate_apply is True
 
 
 async def test_domain_states_use_a_single_subscription() -> None:
@@ -1212,6 +2080,19 @@ async def test_control_role_change_is_applied() -> None:
         assert control.supports_power is False
 
 
+async def test_control_selection_drops_a_value_that_is_no_entity_id() -> None:
+    """A stored selection that is no entity ID must not take the other controls down."""
+    states = [_state("media_player.kitchen", "Kitchen")]
+    async with _start_provider(
+        states, **{CONF_POWER_CONTROLS: ["power_controls", "media_player.kitchen"]}
+    ) as (provider, hass):
+        await provider.loaded_in_mass()
+
+        assert set(provider._player_controls or {}) == {"media_player.kitchen"}
+        # Home Assistant refuses the whole subscription when it carries the stray value
+        assert hass.subscriptions[-1] == ["media_player.kitchen"]
+
+
 @pytest.mark.parametrize(
     "changed_keys",
     [
@@ -1231,3 +2112,42 @@ async def test_other_config_change_reloads_provider(changed_keys: set[str]) -> N
 
         mass.call_later.assert_called_once()
         assert mass.call_later.call_args[0][1] is mass.load_provider_config
+
+
+async def test_init_cancelled_during_connect_unregisters_search_command() -> None:
+    """Test a setup timeout while connecting releases the search command for the next init."""
+    hass = _HomeAssistantClient([])
+    hass.connect = AsyncMock(side_effect=asyncio.Event().wait)  # type: ignore[method-assign]
+    mass = _mass()
+    unregister = MagicMock()
+    mass.register_api_command = MagicMock(return_value=unregister)
+    manifest = MagicMock()
+    manifest.domain = "hass"
+    manifest.name = "Home Assistant"
+    with patch("music_assistant.providers.hass.HomeAssistantClient", return_value=hass):
+        provider = await setup(mass, manifest, _config())
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.1):
+                await provider.handle_async_init()
+
+    unregister.assert_called_once()
+
+
+async def test_unexpected_connect_error_unregisters_search_command() -> None:
+    """Test an unexpected error while connecting releases the search command for the next init."""
+    hass = _HomeAssistantClient(
+        [], connect_error=TypeError("Received message 257:None is not WSMsgType.TEXT")
+    )
+    mass = _mass()
+    unregister = MagicMock()
+    mass.register_api_command = MagicMock(return_value=unregister)
+    manifest = MagicMock()
+    manifest.domain = "hass"
+    manifest.name = "Home Assistant"
+    with patch("music_assistant.providers.hass.HomeAssistantClient", return_value=hass):
+        provider = await setup(mass, manifest, _config())
+        with pytest.raises(TypeError):
+            await provider.handle_async_init()
+
+    unregister.assert_called_once()
+    assert hass.disconnected

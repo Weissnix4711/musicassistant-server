@@ -1,0 +1,202 @@
+"""OpenAI Compatible plugin provider for Music Assistant."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
+from music_assistant_models.enums import ConfigEntryType, ProviderFeature
+from music_assistant_models.errors import (
+    MusicAssistantError,
+    SetupFailedError,
+    UnsupportedFeaturedException,
+)
+
+from music_assistant.models.plugin import AIEngine, ImageEngine, PluginProvider
+
+from .constants import (
+    CHAT_REQUEST_TIMEOUT,
+    CONF_API_KEY,
+    CONF_BASE_URL,
+    CONF_IMAGE_MODELS,
+    CONF_MODELS,
+    IMAGE_REQUEST_TIMEOUT,
+    MODELS_REQUEST_TIMEOUT,
+)
+from .helpers import chat_completion, image_generation, list_models
+
+if TYPE_CHECKING:
+    from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
+    from music_assistant_models.provider import ProviderManifest
+
+    from music_assistant.mass import MusicAssistant
+    from music_assistant.models import ProviderInstanceType
+
+
+SUPPORTED_FEATURES = {ProviderFeature.AI_QUERY}
+
+
+async def setup(
+    mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
+) -> ProviderInstanceType:
+    """Initialize provider(instance) with given configuration."""
+    return OpenAICompatibleProvider(mass, manifest, config, SUPPORTED_FEATURES)
+
+
+def model_config_entries(
+    discovered: list[str], models: list[str], image_models: list[str]
+) -> tuple[ConfigEntry, ConfigEntry]:
+    """
+    Return the config entries to pick the text and the image models with.
+
+    :param discovered: The models the endpoint advertises.
+    :param models: The text models currently picked.
+    :param image_models: The image models currently picked.
+    """
+    # the listing is the natural source for the options, but it is optional in the
+    # OpenAI API: with no options at all the frontend accepts freely typed names,
+    # and keeping the current selection in the list survives a model disappearing
+    return (
+        ConfigEntry(
+            key=CONF_MODELS,
+            type=ConfigEntryType.STRING,
+            multi_value=True,
+            required=False,
+            default_value=[],
+            options=[
+                ConfigValueOption(model, title=model) for model in sorted({*discovered, *models})
+            ],
+            category="features",
+        ),
+        ConfigEntry(
+            key=CONF_IMAGE_MODELS,
+            type=ConfigEntryType.STRING,
+            multi_value=True,
+            required=False,
+            default_value=[],
+            options=[
+                ConfigValueOption(model, title=model)
+                for model in sorted({*discovered, *image_models})
+            ],
+            category="features",
+        ),
+    )
+
+
+def parse_models(value: ConfigValueType) -> list[str]:
+    """
+    Return the model names held by a stored model selection, in a stable order.
+
+    :param value: The stored value of a model selection entry.
+    """
+    if not isinstance(value, list):
+        return []
+    return sorted({model.strip() for model in value if isinstance(model, str) and model.strip()})
+
+
+class OpenAICompatibleProvider(PluginProvider):
+    """Exposes the models of an OpenAI-compatible API as selectable AI and image engines."""
+
+    # image models that turned out to need the images endpoint, so later requests skip
+    # the chat completion attempt
+    _images_endpoint_models: set[str]
+    # image models that turned out to refuse being asked for an inline image, so later
+    # requests ask them plainly
+    _no_format_models: set[str]
+
+    async def handle_async_init(self) -> None:
+        """Handle async initialization of the provider."""
+        if not self._base_url:
+            msg = "No API base URL is configured"
+            raise SetupFailedError(msg)
+        self._images_endpoint_models = set()
+        self._no_format_models = set()
+
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return the (options) config entries to configure this provider instance."""
+        return model_config_entries(
+            await self._discover_models(),
+            self._configured_models(),
+            self._configured_models(CONF_IMAGE_MODELS),
+        )
+
+    async def get_ai_engines(self) -> list[AIEngine]:
+        """Return the AI engines this plugin exposes."""
+        # the engine name carries no provider name: consumers label a picker option
+        # as "<provider name> | <engine name>" themselves
+        return [
+            AIEngine(id=model, name=model, provider=self) for model in self._configured_models()
+        ]
+
+    async def get_image_engines(self) -> list[ImageEngine]:
+        """Return the image engines this plugin exposes."""
+        return [
+            ImageEngine(id=model, name=model, provider=self)
+            for model in self._configured_models(CONF_IMAGE_MODELS)
+        ]
+
+    async def ai_query(self, query: str, engine_id: str | None = None) -> str:
+        """Handle an AI query."""
+        model = engine_id or next(iter(self._configured_models()), None)
+        if model is None:
+            msg = "No model is selected for this provider"
+            raise UnsupportedFeaturedException(msg)
+        return await chat_completion(
+            self.mass,
+            self._base_url,
+            self._api_key,
+            model=model,
+            prompt=query,
+            timeout=CHAT_REQUEST_TIMEOUT,
+        )
+
+    async def ai_generate_image(self, prompt: str, engine_id: str | None = None) -> bytes:
+        """Generate an image from a text prompt."""
+        model = engine_id or next(iter(self._configured_models(CONF_IMAGE_MODELS)), None)
+        if model is None:
+            msg = "No image model is selected for this provider"
+            raise UnsupportedFeaturedException(msg)
+        image, used_images_endpoint = await image_generation(
+            self.mass,
+            self._base_url,
+            self._api_key,
+            model=model,
+            prompt=prompt,
+            timeout=IMAGE_REQUEST_TIMEOUT,
+            use_images_endpoint=model in self._images_endpoint_models,
+            no_format_models=self._no_format_models,
+        )
+        if used_images_endpoint:
+            self._images_endpoint_models.add(model)
+        return image
+
+    @property
+    def _base_url(self) -> str:
+        """Return the configured API endpoint, without trailing slash."""
+        # read on demand: the config entries are resolved before async init runs,
+        # so this has to be readable without it
+        return str(self.get_setup_value(CONF_BASE_URL) or "").strip().rstrip("/")
+
+    @property
+    def _api_key(self) -> str:
+        """Return the configured API key, empty for an endpoint without auth."""
+        api_key = self.get_setup_value(CONF_API_KEY)
+        return api_key.strip() if isinstance(api_key, str) else ""
+
+    def _configured_models(self, key: str = CONF_MODELS) -> list[str]:
+        """
+        Return the models the user selected, in a stable order.
+
+        :param key: The config entry holding the selection.
+        """
+        return parse_models(self.get_config_value(key))
+
+    async def _discover_models(self) -> list[str]:
+        """Return the models the endpoint advertises, empty when it cannot be asked."""
+        try:
+            return await list_models(
+                self.mass, self._base_url, self._api_key, MODELS_REQUEST_TIMEOUT
+            )
+        except MusicAssistantError as err:
+            self.logger.warning("Could not retrieve the list of available models: %s", err)
+            return []

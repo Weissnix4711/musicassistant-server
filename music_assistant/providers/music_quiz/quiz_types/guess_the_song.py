@@ -15,12 +15,12 @@ from music_assistant_models.media_items import Track
 
 from music_assistant.helpers.json import json_dumps
 from music_assistant.providers.music_quiz.ai_distractors import (
-    AI_QUERY_TIMEOUT_SECONDS,
     AIDistractorResponse,
     bounded_ai_context,
     parse_ai_distractor_response,
     request_ai_distractors,
 )
+from music_assistant.providers.music_quiz.constants import AI_QUERY_TIMEOUT_SECONDS
 from music_assistant.providers.music_quiz.errors import TRANSLATION_OWNER
 from music_assistant.providers.music_quiz.models import (
     DEFAULT_TRIVIA_LANGUAGE,
@@ -286,6 +286,7 @@ class GuessTheSongQuizType(QuizType):
                 top_tracks = await self.mass.music.artists.top_tracks(
                     item_id=similar_artist.item_id,
                     provider_instance_id_or_domain=similar_artist.provider,
+                    limit=None,
                 )
             except Exception as err:
                 LOGGER.debug("Could not fetch top tracks for %s: %s", similar_artist.name, err)

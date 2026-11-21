@@ -27,12 +27,16 @@ from aiohttp.web import Request, Response
 from music_assistant_models.config_entries import UI_ONLY, ConfigEntry, ConfigValueType
 from music_assistant_models.enums import ConfigEntryType, EventType, FlowStepType
 from music_assistant_models.errors import ActionUnavailable
-from music_assistant_models.setup_flow import SetupFlowStep
+from music_assistant_models.setup_flow import SetupFlowStep, TranslationRef
 
+from music_assistant.constants import ENCRYPT_SUFFIX
 from music_assistant.helpers.json import json_loads
+from music_assistant.helpers.security import contains_encrypted_value
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Mapping
+
+    from music_assistant_models.auth import User
 
     from music_assistant.mass import MusicAssistant
 
@@ -42,6 +46,9 @@ _T = TypeVar("_T")
 
 FlowKind = Literal["setup", "reconfigure"]
 FlowReason = Literal["user", "auth", "error"]
+
+# FINISH step id the frontend closes on immediately, without showing a success screen
+FINISH_STEP_SILENT = "finish_silent"
 
 CALLBACK_RESPONSE_HTML = """
 <html>
@@ -60,16 +67,27 @@ class SetupFlowError(Exception):
     or let it propagate so the engine aborts the flow with the failure message.
     """
 
-    def __init__(self, message: str, translation_key: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        translation_key: str | None = None,
+        translation_args: list[Any] | None = None,
+        translation_owner: str | None = None,
+    ) -> None:
         """
         Initialize the error.
 
         :param message: Human readable (English) description of the failure.
         :param translation_key: Optional (bare) translation slug of the underlying error,
             usable by flow authors as a localizable form error.
+        :param translation_args: Optional positional arguments for placeholders in the translated
+            error message.
+        :param translation_owner: Optional namespace owning the translated error message.
         """
         super().__init__(message)
         self.translation_key = translation_key
+        self.translation_args = translation_args or []
+        self.translation_owner = translation_owner
 
 
 class StepExpiredError(Exception):
@@ -113,6 +131,12 @@ class SetupFlowContext:
     setup_data: dict[str, Any] = field(default_factory=dict)
     # values: the target's existing (options) config values, for prefill
     values: dict[str, ConfigValueType] = field(default_factory=dict)
+    # manages_all_sources: whether the caller manages every music source (the server itself
+    # or such a user); false for a user who adds a music source of its own
+    manages_all_sources: bool = True
+    # user: the user who started a provider flow; None when the server started it, and in a
+    # player flow
+    user: User | None = None
 
 
 class SetupSession:
@@ -148,6 +172,11 @@ class SetupSession:
         self.current_step: SetupFlowStep | None = None
         self.finished = False
         self.last_activity = time.monotonic()
+        # i18n slug of the terminal FINISH step; the engine swaps in a variant when the
+        # target warrants extra closing copy (e.g. a music provider's initial library import)
+        self.finish_step_id = "finish"
+        # the (options) config values handed to finish(), which the engine stores on the target
+        self.finish_options: dict[str, ConfigValueType] = {}
         self._finish_handler = finish_handler
         self._translation_owner = f"provider.{context.domain}"
         self._callback_path = f"/setup_flow/callback/{flow_id}"
@@ -171,31 +200,42 @@ class SetupSession:
         self,
         entries: list[ConfigEntry],
         step_id: str = "user",
-        errors: dict[str, str] | None = None,
+        errors: Mapping[str, str | SetupFlowError] | None = None,
         last_step: bool | None = None,
         expires_in: float | None = None,
         translation_params: list[str] | None = None,
+        copy_text: str | None = None,
     ) -> dict[str, ConfigValueType]:
         """
         Show a form to the user and wait for the submitted (validated) values.
 
         :param entries: The config entries that make up the form fields.
         :param step_id: Stable slug identifying this step (also the i18n key segment).
-        :param errors: Optional field-key (or "base") -> error slug to display.
+        :param errors: Optional field-key (or "base") -> error slug, message, or setup error.
+            Setup errors retain translation metadata for localization in each client's language.
         :param last_step: Optional hint that this is the flow's final form.
         :param expires_in: Optional deadline in seconds; when it passes,
             StepExpiredError is raised here (and the client countdown runs out).
         :param translation_params: Optional values for placeholders in the step translations.
+        :param copy_text: Optional value the client may copy to the clipboard.
         """
         step = self._build_step(
             FlowStepType.FORM,
             step_id,
             entries=self._prepare_entries(entries),
-            errors=dict(errors) if errors else {},
+            errors={key: str(error) for key, error in (errors or {}).items()},
             last_step=last_step,
             translation_params=translation_params,
             expires_in=expires_in,
+            copy_text=copy_text,
         )
+        for key, error in (errors or {}).items():
+            if isinstance(error, SetupFlowError) and error.translation_key:
+                step.error_translations[key] = TranslationRef(
+                    key=error.translation_key,
+                    args=list(error.translation_args),
+                    owner=error.translation_owner,
+                )
         self._input_future = asyncio.get_running_loop().create_future()
         self._publish_step(step)
         try:
@@ -239,6 +279,8 @@ class SetupSession:
         url: str,
         step_id: str = "auth",
         expires_in: float | None = None,
+        translation_params: list[str] | None = None,
+        copy_text: str | None = None,
     ) -> _T:
         """
         Show an external "Open URL" step that completes when ``awaitable`` resolves.
@@ -253,8 +295,18 @@ class SetupSession:
         :param step_id: Stable slug identifying this step (also the i18n key segment).
         :param expires_in: Optional deadline in seconds; when it passes,
             StepExpiredError is raised here (and the client countdown runs out).
+        :param translation_params: Optional values for placeholders in the step
+            translations, e.g. a device code the user has to read off the screen.
+        :param copy_text: Optional value the client may copy to the clipboard.
         """
-        step = self._build_step(FlowStepType.EXTERNAL, step_id, url=url, expires_in=expires_in)
+        step = self._build_step(
+            FlowStepType.EXTERNAL,
+            step_id,
+            url=url,
+            expires_in=expires_in,
+            translation_params=translation_params,
+            copy_text=copy_text,
+        )
         self._publish_step(step)
         return await self._await_with_deadline(awaitable, expires_in)
 
@@ -293,7 +345,7 @@ class SetupSession:
         step's countdown and the engine deadline cannot drift. On the deadline
         StepExpiredError is raised here and the awaitable is cancelled - this also
         cancels a pre-existing Task (cancellation propagates through the await);
-        wrap work in ``asyncio.shield`` if it must survive the deadline.
+        pass ``join_task(task)`` (helpers.util) if a task must survive the deadline.
 
         :param awaitable: The work/wait to perform while the progress step shows.
         :param step_id: Stable slug identifying this step (also the i18n key segment).
@@ -307,7 +359,11 @@ class SetupSession:
         self._publish_step(step)
         return await self._await_with_deadline(awaitable, expires_in)
 
-    async def finish(self, values: dict[str, ConfigValueType]) -> dict[str, str]:
+    async def finish(
+        self,
+        values: dict[str, ConfigValueType],
+        options: dict[str, ConfigValueType] | None = None,
+    ) -> dict[str, str]:
         """
         Complete the flow: persist the collected values and create/reload the target.
 
@@ -317,13 +373,17 @@ class SetupSession:
         (e.g. ``{"instance_id": ...}``) is returned.
 
         :param values: The values to persist as the target's setup_data.
+        :param options: Optional values for the target's (options) config entries, for a choice
+            its settings offer as well. Stored as given (unencrypted) and supported for
+            provider flows only.
         """
         if self.finished:
             msg = "Setup flow already finished"
             raise RuntimeError(msg)
+        self.finish_options = dict(options or {})
         result = await self._finish_handler(self, values)
         self.finished = True
-        step = self._build_step(FlowStepType.FINISH, "finish", result=result)
+        step = self._build_step(FlowStepType.FINISH, self.finish_step_id, result=result)
         self._publish_step(step)
         return result
 
@@ -385,14 +445,26 @@ class SetupSession:
         self.last_activity = time.monotonic()
         errors: dict[str, str] = {}
         parsed: dict[str, ConfigValueType] = {}
+        # gates resolve against the submitted values, so flipping one takes effect on the
+        # same submit regardless of where it sits on the form
+        submitted_entries = [
+            replace(entry, value=values.get(entry.key, entry.value)) for entry in step.entries
+        ]
         for entry in step.entries:
             if entry.type in UI_ONLY:
                 continue
             raw_value = values.get(entry.key, entry.value)
             try:
+                # encrypted values are only ever created by the server, never submitted
+                if contains_encrypted_value(raw_value):
+                    raise ValueError("Encrypted values can not be submitted")  # noqa: TRY301 - handled by except below
                 # parse_value also runs the entry's optional validate callback and
                 # stores the parsed value on the entry (echoed on a re-render)
-                parsed[entry.key] = entry.parse_value(raw_value, allow_none=False)
+                # an entry behind an unmet dependency renders disabled, so demanding a
+                # value the user has no way to supply would wedge the flow
+                parsed[entry.key] = entry.parse_value(
+                    raw_value, allow_none=not entry.dependency_met(submitted_entries)
+                )
             except TypeError, ValueError:
                 errors[entry.key] = "required" if raw_value in (None, "") else "invalid_value"
                 if not isinstance(raw_value, list):
@@ -401,6 +473,7 @@ class SetupSession:
                 # secure values are only handed to the flow coroutine; they are never
                 # kept on (or echoed back with) the stored step
                 entry.value = None
+        step.error_translations.clear()
         if errors:
             step.errors = errors
             self._publish_step(step)
@@ -432,8 +505,10 @@ class SetupSession:
                         LOGGER.error("Ignoring non-object JSON setup flow callback body")
                 else:
                     params.update({key: str(val) for key, val in (await request.post()).items()})
-            except Exception as err:
+            except Exception as err:  # noqa: BLE001 - an outside request body can fail to parse in many ways
                 LOGGER.error("Failed to parse setup flow callback body: %s", err)
+        # encrypted config values are never accepted as callback params
+        params = {key: val for key, val in params.items() if not val.startswith(ENCRYPT_SUFFIX)}
         if self._callback_future is not None and not self._callback_future.done():
             # the values carry the authorization code/token, so only log the keys
             LOGGER.debug(
@@ -465,14 +540,20 @@ class SetupSession:
         except TimeoutError:
             return
 
-    def publish_abort(self, reason: str) -> None:
+    def publish_abort(self, reason: str | SetupFlowError) -> None:
         """
         Publish the terminal ABORT step for this flow.
 
-        :param reason: Slug describing why the flow was aborted; resolved from the
-            translations (setup_flow.abort.<reason>) when the step is served.
+        :param reason: Abort slug or setup error, localized when the step is served.
+            Slugs resolve under setup_flow.abort; setup errors use their error metadata.
         """
-        step = self._build_step(FlowStepType.ABORT, "abort", reason=reason)
+        step = self._build_step(FlowStepType.ABORT, "abort", reason=str(reason) or "internal_error")
+        if isinstance(reason, SetupFlowError) and reason.translation_key:
+            step.reason_translation = TranslationRef(
+                key=reason.translation_key,
+                args=list(reason.translation_args),
+                owner=reason.translation_owner,
+            )
         self._publish_step(step)
 
     def close(self) -> None:
@@ -513,6 +594,7 @@ class SetupSession:
         result: dict[str, str] | None = None,
         reason: str | None = None,
         translation_params: list[str] | None = None,
+        copy_text: str | None = None,
         expires_in: float | None = None,
     ) -> SetupFlowStep:
         """Build a SetupFlowStep for this flow, stamping owner and absolute deadline."""
@@ -533,6 +615,7 @@ class SetupSession:
             reason=reason,
             translation_owner=self._translation_owner,
             translation_params=translation_params,
+            copy_text=copy_text,
         )
 
     def _prepare_entries(self, entries: list[ConfigEntry]) -> list[ConfigEntry]:

@@ -28,6 +28,7 @@ from music_assistant_models.media_items import (
 from music_assistant_models.streamdetails import StreamDetails
 from radios import FilterBy, Order, RadioBrowser, RadioBrowserError, Station
 
+from music_assistant.constants import MASS_USER_AGENT
 from music_assistant.controllers.cache import use_cache
 from music_assistant.models.music_provider import MusicProvider
 
@@ -54,15 +55,18 @@ async def setup(
 class RadioBrowserProvider(MusicProvider):
     """Provider implementation for RadioBrowser."""
 
+    @property
+    def max_concurrent_streams(self) -> None:
+        """Allow unlimited concurrent upstream source streams."""
+        return None
+
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to configure this provider."""
         return ()
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
-        self.radios = RadioBrowser(
-            session=self.mass.http_session, user_agent=f"MusicAssistant/{self.mass.version}"
-        )
+        self.radios = RadioBrowser(session=self.mass.http_session, user_agent=MASS_USER_AGENT)
         try:
             await self.radios.stats()
         except RadioBrowserError as err:

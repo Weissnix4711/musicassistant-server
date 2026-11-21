@@ -1,10 +1,12 @@
 """Tests for utility/helper functions."""
 
+import asyncio
 import logging
 import os
 import signal
 import subprocess
 import sys
+import threading
 from ipaddress import IPv4Address, IPv6Address
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -120,6 +122,37 @@ def test_version_extract() -> None:
     assert version == "Oliver Smith Remix (Mixed)"
 
 
+def test_version_extracts_multiple_qualifiers() -> None:
+    """All recognized title qualifiers contribute to the version."""
+    title, version = util.parse_title_and_version("( ) [Deluxe] [2022 Remaster]")
+
+    assert title == "( )"
+    assert version == "Deluxe 2022 Remaster"
+
+
+@pytest.mark.parametrize(
+    ("test_str", "expected"),
+    [
+        ("Barcelona (Special Edition - Deluxe)", ("Barcelona", "Special Edition - Deluxe")),
+        (
+            "All of Me (Tiësto's Birthday Treatment Remix - Radio Edit)",
+            ("All of Me", "Tiësto's Birthday Treatment Remix - Radio Edit"),
+        ),
+        (
+            "Crime Of The Century (2014 - HD Remaster)",
+            ("Crime Of The Century", "2014 - HD Remaster"),
+        ),
+        ("Song (Live) - Remastered 2011", ("Song", "Live Remastered 2011")),
+        ("Song (Remastered) (Remastered)", ("Song", "Remastered")),
+        ("Allejoppa - Extended [Extended]", ("Allejoppa", "Extended")),
+        ("Song - Single (Deluxe)", ("Song", "Deluxe Single")),
+    ],
+)
+def test_version_extract_sequential_passes(test_str: str, expected: tuple[str, str]) -> None:
+    """Later parsing passes see the title as reduced by earlier passes."""
+    assert util.parse_title_and_version(test_str) == expected
+
+
 def test_with_handling_in_titles() -> None:
     """Test 'with' handling - preserved in title, stripped as featuring credit."""
     # 'with you' (preserved as title word)
@@ -179,6 +212,57 @@ def test_with_handling_in_titles() -> None:
     assert version == "Remix"
 
 
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("Great Song (with John Smith)", ("John Smith",)),
+        ("Great Song [with Jane Doe]", ("Jane Doe",)),
+        ("Great Song - with John Smith (Duet)", ("John Smith",)),
+        ("Rockin' Around (With You)", ()),
+        ("The Catastrophe (Good Luck with That Man)", ()),
+        # Title-word exceptions must protect arbitrary continuations too.
+        ("Example Song (With You Tonight)", ()),
+        ("Great Song (feat:Alice)", ("Alice",)),
+        # Bare leading markers are part of the title, not a credit.
+        ("Featuring Alice", ()),
+        ("Featuring Bob", ()),
+        ("Ft Bob", ()),
+    ],
+)
+def test_extract_title_artist_credits(title: str, expected: tuple[str, ...]) -> None:
+    """Embedded artist credits use the same title-word exceptions as title parsing."""
+    assert util.extract_title_artist_credits(title) == expected
+
+
+def test_with_artist_credit_preserves_trailing_title_content() -> None:
+    """Search normalization removes the credit without consuming later title content."""
+    assert util.parse_title_and_version(
+        "Great Song - with John Smith (Duet)",
+        strip_for_search=True,
+    ) == ("Great Song (Duet)", "")
+
+
+def test_bare_colon_feature_credit_stripped_for_search() -> None:
+    """A bare, unbracketed colon-form featured credit is stripped like the other forms."""
+    assert util.parse_title_and_version(
+        "Great Song feat:Alice",
+        strip_for_search=True,
+    ) == ("Great Song", "")
+
+
+def test_bare_credit_marker_without_leading_title_is_not_stripped() -> None:
+    """A title that starts with a bare credit marker keeps its full text, not an empty title."""
+    assert util.parse_title_and_version(
+        "Featuring Alice",
+        strip_for_search=True,
+    ) == ("Featuring Alice", "")
+    # Distinct leading-marker titles must stay distinct after normalization.
+    assert util.parse_title_and_version(
+        "Featuring Bob",
+        strip_for_search=True,
+    ) == ("Featuring Bob", "")
+
+
 async def test_uri_parsing() -> None:
     """Test parsing of URI."""
     # test regular uri
@@ -220,15 +304,21 @@ async def test_uri_parsing() -> None:
     # test invalid uri
     with pytest.raises(MusicAssistantError):
         await uri.parse_uri("invalid://blah")
+    with pytest.raises(MusicAssistantError):
+        await uri.parse_uri("https://open.spotify.com")
+    with pytest.raises(MusicAssistantError):
+        await uri.parse_uri("https://open.spotify.com/track/")
+    with pytest.raises(MusicAssistantError):
+        await uri.parse_uri("https://tidal.com/browse/track/")
 
 
 async def test_apple_music_uri_parsing() -> None:
     """Test parsing of Apple Music share URLs."""
-    # station — should resolve as PLAYLIST (is_dynamic)
+    # station — should resolve as RADIO (is_dynamic)
     media_type, provider, item_id = await uri.parse_uri(
         "https://music.apple.com/de/station/dead-sara-essentials/ra.331701075"
     )
-    assert media_type == MediaType.PLAYLIST
+    assert media_type == MediaType.RADIO
     assert provider == "apple_music"
     assert item_id == "ra.331701075"
     # playlist
@@ -263,7 +353,7 @@ async def test_apple_music_uri_parsing() -> None:
     media_type, provider, item_id = await uri.parse_uri(
         "https://music.apple.com/de/station/some-station/ra.111222333/"
     )
-    assert media_type == MediaType.PLAYLIST
+    assert media_type == MediaType.RADIO
     assert item_id == "ra.111222333"
     # query string stripped (non-track query params)
     media_type, provider, item_id = await uri.parse_uri(
@@ -398,11 +488,29 @@ def test_get_zeroconf_args_dual_stack() -> None:
     adapters = [
         _make_mock_adapter("eth0", ["192.168.1.10"], [("fd00::1", 0, 2)]),
     ]
-    with patch("music_assistant.helpers.util.ifaddr.get_adapters", return_value=adapters):
+    with (
+        patch("music_assistant.helpers.util.ifaddr.get_adapters", return_value=adapters),
+        patch("music_assistant.helpers.util.sys.platform", "linux"),
+    ):
         result = util.get_zeroconf_args(use_all_interfaces=False)
     assert result["ip_version"] == IPVersion.All
     assert isinstance(result["interfaces"], list)
     assert "192.168.1.10" in result["interfaces"]
+
+
+@pytest.mark.parametrize("platform", ["darwin", "freebsd14"])
+def test_get_zeroconf_args_dual_stack_ipv4_fallback(platform: str) -> None:
+    """Test that a dual-stack host falls back to IPv4-only on macOS/FreeBSD."""
+    adapters = [
+        _make_mock_adapter("eth0", ["192.168.1.10"], [("fd00::1", 0, 2)]),
+    ]
+    with (
+        patch("music_assistant.helpers.util.ifaddr.get_adapters", return_value=adapters),
+        patch("music_assistant.helpers.util.sys.platform", platform),
+    ):
+        result = util.get_zeroconf_args(use_all_interfaces=False)
+    assert result["ip_version"] == IPVersion.V4Only
+    assert result["interfaces"] == InterfaceChoice.Default
 
 
 def test_get_zeroconf_args_ipv4_only() -> None:
@@ -444,7 +552,10 @@ def test_get_zeroconf_args_all_interfaces() -> None:
     adapters = [
         _make_mock_adapter("eth0", ["192.168.1.10"], [("fd00::1", 0, 2)]),
     ]
-    with patch("music_assistant.helpers.util.ifaddr.get_adapters", return_value=adapters):
+    with (
+        patch("music_assistant.helpers.util.ifaddr.get_adapters", return_value=adapters),
+        patch("music_assistant.helpers.util.sys.platform", "linux"),
+    ):
         result = util.get_zeroconf_args(use_all_interfaces=True)
     assert result["ip_version"] == IPVersion.All
     assert isinstance(result["interfaces"], list)
@@ -477,6 +588,20 @@ def test_interface_name_for_ip_no_match() -> None:
     ]
     with patch("music_assistant.helpers.util.ifaddr.get_adapters", return_value=adapters):
         assert util.interface_name_for_ip("10.0.0.1") is None
+
+
+def test_interface_name_for_ip_matches_any_ipv6_notation() -> None:
+    """An IPv6 address written in a non-canonical notation still resolves to its interface."""
+    adapters = [
+        _make_mock_adapter("eth0", ipv6_addrs=[("2001:db8::10", 0, 2)]),
+    ]
+    with patch("music_assistant.helpers.util.ifaddr.get_adapters", return_value=adapters):
+        assert util.interface_name_for_ip("2001:DB8:0:0::10") == "eth0"
+
+
+def test_interface_name_for_ip_rejects_a_non_ip_value() -> None:
+    """A value that is not an IP address returns None."""
+    assert util.interface_name_for_ip("not-an-ip") is None
 
 
 @pytest.mark.parametrize("capability", ["DEFAULT", "NO AVX"])
@@ -802,6 +927,18 @@ def test_cap_native_thread_pools_sets_env() -> None:
             assert os.environ[env_var] == "2"
 
 
+def test_set_model_cache_dirs_points_torch_hub_into_cache_dir(tmp_path: Path) -> None:
+    """Model downloads land in the MA cache dir instead of the possibly unwritable ~/.cache."""
+    import torch  # noqa: PLC0415
+
+    with patch.dict(os.environ):
+        os.environ.pop("TORCH_HOME", None)
+        os.environ.pop("HF_HOME", None)
+        util.set_model_cache_dirs(str(tmp_path))
+        assert torch.hub.get_dir() == str(tmp_path / "torch" / "hub")
+        assert os.environ["HF_HOME"] == str(tmp_path / "huggingface")
+
+
 def test_cap_native_thread_pools_respects_operator_value() -> None:
     """An operator-supplied cap is kept, reported back, and applied to the other pools."""
     with (
@@ -939,3 +1076,31 @@ def test_encoded_request_url(url: str, expected: str | URL) -> None:
     assert type(result) is type(expected)
     # the percent-escapes must survive intact for auth-bearing stream URLs
     assert str(result) == url
+
+
+async def test_get_mac_address_gives_up_on_a_hanging_lookup() -> None:
+    """A hanging getmac lookup must not block callers, nor tie up a thread per call."""
+    release = threading.Event()
+    calls: list[str] = []
+
+    def hanging_lookup(ip: str) -> str:
+        calls.append(ip)
+        release.wait(5)
+        return "aa:bb:cc:dd:ee:ff"
+
+    try:
+        with (
+            patch("getmac.get_mac_address", new=hanging_lookup),
+            patch.object(util, "MAC_LOOKUP_TIMEOUT", 0.1),
+        ):
+            assert await util.get_mac_address("192.168.1.10") is None
+            assert await util.get_mac_address("192.168.1.10") is None
+            assert calls == ["192.168.1.10"]
+            release.set()
+            async with asyncio.timeout(2):
+                while util._PENDING_MAC_LOOKUPS:
+                    await asyncio.sleep(0.01)
+            assert await util.get_mac_address("192.168.1.10") == "aa:bb:cc:dd:ee:ff"
+            assert len(calls) == 2
+    finally:
+        release.set()

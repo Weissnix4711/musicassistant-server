@@ -5,15 +5,31 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
-from music_assistant_models.enums import MediaType, ProviderFeature, ProviderType
-from music_assistant_models.media_items import ItemMapping, RecommendationFolder, UniqueList
+import pytest
+from music_assistant_models.auth import User, UserRole
+from music_assistant_models.config_entries import ProviderAccess
+from music_assistant_models.enums import (
+    MediaType,
+    ProviderFeature,
+    ProviderSharing,
+    ProviderType,
+)
+from music_assistant_models.media_items import (
+    Audiobook,
+    ItemMapping,
+    PodcastEpisode,
+    RecommendationFolder,
+    UniqueList,
+)
 
-from music_assistant.controllers.music.recommendations.library import library_rows
 from music_assistant.mass import MusicAssistant
 from music_assistant.models.music_provider import MusicProvider
+from music_assistant.models.plugin import PluginProvider
+from music_assistant.providers.recommendations import LibraryRecommendationsProvider
+from tests.common import set_music_source_access
+from tests.controllers.music.helpers import create_track
 
 if TYPE_CHECKING:
-    import pytest
     from music_assistant_models.media_items import BrowseFolder, MediaItemType
 
 
@@ -81,6 +97,15 @@ class _OneRowProvider(MusicProvider):
         ]
 
 
+def _restricted_user(mass: MusicAssistant) -> User:
+    """Return a user that may not use the "restricted_instance" music source."""
+    set_music_source_access(
+        mass,
+        {"restricted_instance": ProviderAccess(owner="user-b", sharing=ProviderSharing.PRIVATE)},
+    )
+    return User(user_id="user-a", username="user-a", role=UserRole.USER)
+
+
 def _build(provider_cls: type[MusicProvider], instance_id: str = "fake_instance") -> MusicProvider:
     """Construct a minimal provider with stubbed mass/manifest/config."""
     mass = MagicMock()
@@ -100,30 +125,45 @@ async def test_rows_interleaved_builtin_first(
     mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Builtin and provider rows are interleaved one per source per pass, builtin first."""
+    recommendations_provider = mass.get_provider("recommendations")
+    assert recommendations_provider is not None
+    assert isinstance(recommendations_provider, LibraryRecommendationsProvider)
     prov_a = _build(_RowsProvider, instance_id="prov_a")
     prov_b = _build(_RowsProvider, instance_id="prov_b")
     monkeypatch.setattr(
-        mass, "get_providers_supporting_feature", lambda *_a, **_k: [prov_a, prov_b]
+        mass,
+        "get_providers_supporting_feature",
+        lambda *_a, **_k: [recommendations_provider, prov_a, prov_b],
     )
     folders = await mass.music.recommendations.get_recommendations()
-    assert [f.provider for f in folders[:3]] == ["library", "prov_a", "prov_b"]
-    assert all(f.provider == "library" for f in folders[3:])
+    assert [f.provider for f in folders[:3]] == ["recommendations", "prov_a", "prov_b"]
+    assert all(f.provider == "recommendations" for f in folders[3:])
 
 
 async def test_rows_interleave_uneven_provider_lengths_no_tail_dropped(
     mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Providers with fewer rows than the builtin sources still contribute all their rows."""
+    recommendations_provider = mass.get_provider("recommendations")
+    assert recommendations_provider is not None
+    assert isinstance(recommendations_provider, LibraryRecommendationsProvider)
     four = _build(_FourRowsProvider, instance_id="four")
     one = _build(_OneRowProvider, instance_id="one")
-    monkeypatch.setattr(mass, "get_providers_supporting_feature", lambda *_a, **_k: [four, one])
+    monkeypatch.setattr(
+        mass,
+        "get_providers_supporting_feature",
+        lambda *_a, **_k: [recommendations_provider, four, one],
+    )
 
     folders = await mass.music.recommendations.get_recommendations()
 
-    builtin_ids = [f.item_id for f in library_rows()]
+    provider = mass.get_provider("recommendations")
+    assert provider is not None
+    assert isinstance(provider, LibraryRecommendationsProvider)
+    builtin_ids = [f.item_id for f in await provider.get_recommendations()]
     expected: list[tuple[str, str]] = []
     for i, builtin_id in enumerate(builtin_ids):
-        expected.append(("library", builtin_id))
+        expected.append(("recommendations", builtin_id))
         if i < 4:
             expected.append(("four", f"four_row_{i}"))
         if i < 1:
@@ -133,13 +173,14 @@ async def test_rows_interleave_uneven_provider_lengths_no_tail_dropped(
     assert len(folders) == len(builtin_ids) + 4 + 1
 
 
+@pytest.mark.parametrize("row_provider", ["fake_instance", "fake"])
 async def test_items_routed_to_provider(
-    mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+    mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch, row_provider: str
 ) -> None:
-    """Items for a provider row are fetched from that provider."""
+    """Items for a provider row are fetched from that provider, named by instance or domain."""
     provider = _build(_RowsProvider)
     monkeypatch.setattr(mass, "get_provider", lambda *_a, **_k: provider)
-    items = await mass.music.recommendations.get_recommendation_items("fake_instance", "row1")
+    items = await mass.music.recommendations.get_recommendation_items(row_provider, "row1")
     assert [item.item_id for item in items] == ["prov-item"]
 
 
@@ -165,8 +206,8 @@ async def test_items_unknown_provider_returns_empty(mass: MusicAssistant) -> Non
 async def test_items_restricted_provider_returns_empty(
     mock_get_user: Mock, mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A user's provider filter blocks fetching items from a restricted music provider."""
-    mock_get_user.return_value = Mock(provider_filter=["allowed_instance"])
+    """Fetching items from a music source the user may not use returns nothing."""
+    mock_get_user.return_value = _restricted_user(mass)
     provider = _build(_RowsProvider, instance_id="restricted_instance")
     provider.get_recommendation_items = AsyncMock()  # type: ignore[method-assign]
     monkeypatch.setattr(mass, "get_provider", lambda *_a, **_k: provider)
@@ -176,12 +217,215 @@ async def test_items_restricted_provider_returns_empty(
 
 
 @patch("music_assistant.controllers.music.controller.get_current_user")
+async def test_items_of_a_restricted_row_are_not_served_by_another_account(
+    mock_get_user: Mock, mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row of a hidden account is not answered by the user's own account of that service."""
+    mock_get_user.return_value = _restricted_user(mass)
+    mine = _build(_RowsProvider, instance_id="mine_instance")
+    mine.get_recommendation_items = AsyncMock()  # type: ignore[method-assign]
+    # the server would widen the hidden instance to the user's own account of the service
+    monkeypatch.setattr(mass, "get_provider", lambda *_a, **_k: mine)
+    items = await mass.music.recommendations.get_recommendation_items("restricted_instance", "row1")
+    assert items == []
+    mine.get_recommendation_items.assert_not_awaited()
+
+
+@patch("music_assistant.controllers.music.controller.get_current_user")
 async def test_rows_restricted_provider_returns_no_rows(
     mock_get_user: Mock, mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A user's provider filter excludes a restricted music provider's rows from the listing."""
-    mock_get_user.return_value = Mock(provider_filter=["allowed_instance"])
+    """A music source the user may not use keeps its rows out of the listing."""
+    mock_get_user.return_value = _restricted_user(mass)
+    set_music_source_access(mass, {"allowed_instance": None})
     restricted = _build(_RowsProvider, instance_id="restricted_instance")
-    monkeypatch.setattr(mass, "get_providers_supporting_feature", lambda *_a, **_k: [restricted])
+    allowed = _build(_RowsProvider, instance_id="allowed_instance")
+    monkeypatch.setattr(
+        mass, "get_providers_supporting_feature", lambda *_a, **_k: [restricted, allowed]
+    )
     folders = await mass.music.recommendations.get_recommendations()
-    assert not any(f.provider == "restricted_instance" for f in folders)
+    assert [(f.provider, f.item_id) for f in folders] == [("allowed_instance", "row1")]
+
+
+async def test_items_providers_forwarded_to_builtin_provider(
+    mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The providers filter is forwarded to the builtin library recommendations provider."""
+    builtin_provider = mass.get_provider("recommendations")
+    assert builtin_provider is not None
+    assert isinstance(builtin_provider, LibraryRecommendationsProvider)
+    spy = AsyncMock(return_value=UniqueList())
+    monkeypatch.setattr(builtin_provider, "get_recommendation_items", spy)
+
+    await mass.music.recommendations.get_recommendation_items(
+        "recommendations", "recently_played", providers=["prov_a"]
+    )
+
+    spy.assert_awaited_once_with("recently_played", providers=["prov_a"])
+
+
+async def test_items_providers_ignored_for_external_provider(
+    mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An external provider row's SPI is unchanged: it never receives the providers filter."""
+    provider = _build(_RowsProvider)
+    monkeypatch.setattr(mass, "get_provider", lambda *_a, **_k: provider)
+
+    items = await mass.music.recommendations.get_recommendation_items(
+        "fake_instance", "row1", providers=["prov_a"]
+    )
+
+    assert [item.item_id for item in items] == ["prov-item"]
+
+
+class _SimilarTracksRow(PluginProvider):
+    """A fake plugin whose row lists a track on a shared and on a private music source."""
+
+    async def get_recommendation_items(
+        self, item_id: str
+    ) -> UniqueList[MediaItemType | ItemMapping | BrowseFolder]:
+        return UniqueList([create_track("open_1", "t1"), create_track("hidden_1", "t2")])
+
+
+@patch("music_assistant.controllers.music.recommendations.controller.get_current_user")
+async def test_items_of_a_plugin_row_leave_out_hidden_sources(
+    mock_get_user: Mock, mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plugin row never lists a track on a music source the user may not see."""
+    mock_get_user.return_value = User(user_id="user-a", username="user-a", role=UserRole.USER)
+    set_music_source_access(
+        mass,
+        {
+            "open_1": None,
+            "hidden_1": ProviderAccess(owner="user-b", sharing=ProviderSharing.PRIVATE),
+        },
+    )
+    manifest = MagicMock(type=ProviderType.PLUGIN, domain="fake_plugin")
+    config = MagicMock(instance_id="plugin_1", get_value=MagicMock(return_value="GLOBAL"))
+    plugin = _SimilarTracksRow(
+        MagicMock(), manifest, config, supported_features={ProviderFeature.RECOMMENDATIONS}
+    )
+    providers = {
+        "plugin_1": plugin,
+        "open_1": Mock(instance_id="open_1", type=ProviderType.MUSIC),
+        "hidden_1": Mock(instance_id="hidden_1", type=ProviderType.MUSIC),
+    }
+    monkeypatch.setattr(
+        mass, "get_provider", lambda instance_id, *_a, **_k: providers.get(instance_id)
+    )
+
+    items = await mass.music.recommendations.get_recommendation_items("plugin_1", "row1")
+
+    assert [item.item_id for item in items] == ["t1"]
+
+
+def _episode(item_id: str, fully_played: bool | None) -> PodcastEpisode:
+    """Create a podcast episode with the given played state."""
+    return PodcastEpisode(
+        item_id=item_id,
+        provider="fake_instance",
+        name=item_id,
+        provider_mappings=set(),
+        position=0,
+        podcast=ItemMapping.from_dict(
+            {
+                "item_id": "pod",
+                "provider": "fake_instance",
+                "media_type": MediaType.PODCAST.value,
+                "name": "Podcast",
+            }
+        ),
+        fully_played=fully_played,
+    )
+
+
+def _audiobook(item_id: str, fully_played: bool | None) -> Audiobook:
+    """Create an audiobook with the given played state."""
+    return Audiobook(
+        item_id=item_id,
+        provider="fake_instance",
+        name=item_id,
+        provider_mappings=set(),
+        fully_played=fully_played,
+    )
+
+
+def _mixed_items() -> list[MediaItemType]:
+    """Return played and unplayed episodes and audiobooks, plus a track."""
+    return [
+        _episode("ep_played", True),
+        _episode("ep_new", False),
+        _episode("ep_unknown", None),
+        _audiobook("book_played", True),
+        _audiobook("book_new", False),
+        create_track("fake_instance", "track_1"),
+    ]
+
+
+class _PlayedRowsProvider(_RowsProvider):
+    """A fake provider whose row lists played and unplayed episodes and audiobooks."""
+
+    async def get_recommendation_items(
+        self, item_id: str
+    ) -> UniqueList[MediaItemType | ItemMapping | BrowseFolder]:
+        return UniqueList(_mixed_items())
+
+
+_KEPT_WHEN_HIDING = ["ep_new", "ep_unknown", "book_new", "track_1"]
+
+
+async def test_items_external_row_keeps_played_by_default(
+    mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without hide_played an external row keeps fully played items."""
+    provider = _build(_PlayedRowsProvider)
+    monkeypatch.setattr(mass, "get_provider", lambda *_a, **_k: provider)
+    items = await mass.music.recommendations.get_recommendation_items("fake_instance", "row1")
+    assert [item.item_id for item in items] == [
+        "ep_played",
+        "ep_new",
+        "ep_unknown",
+        "book_played",
+        "book_new",
+        "track_1",
+    ]
+
+
+async def test_items_external_row_hides_played(
+    mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With hide_played an external row drops fully played episodes and audiobooks only."""
+    provider = _build(_PlayedRowsProvider)
+    monkeypatch.setattr(mass, "get_provider", lambda *_a, **_k: provider)
+    items = await mass.music.recommendations.get_recommendation_items(
+        "fake_instance", "row1", hide_played=True
+    )
+    assert [item.item_id for item in items] == _KEPT_WHEN_HIDING
+
+
+@pytest.mark.parametrize(
+    ("hide_played", "expected"),
+    [
+        (False, [item.item_id for item in _mixed_items()]),
+        (True, _KEPT_WHEN_HIDING),
+    ],
+)
+async def test_items_library_row_hide_played(
+    mass: MusicAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    hide_played: bool,
+    expected: list[str],
+) -> None:
+    """A library row drops fully played episodes and audiobooks only when asked to."""
+    builtin_provider = mass.get_provider("recommendations")
+    assert builtin_provider is not None
+    assert isinstance(builtin_provider, LibraryRecommendationsProvider)
+    monkeypatch.setattr(
+        builtin_provider,
+        "get_recommendation_items",
+        AsyncMock(return_value=UniqueList(_mixed_items())),
+    )
+    items = await mass.music.recommendations.get_recommendation_items(
+        "recommendations", "latest_episodes", hide_played=hide_played
+    )
+    assert [item.item_id for item in items] == expected

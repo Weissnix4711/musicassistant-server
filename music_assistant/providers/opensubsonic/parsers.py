@@ -6,7 +6,7 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from music_assistant_models.enums import ContentType, ImageType, MediaType
+from music_assistant_models.enums import AlbumType, ContentType, ImageType, LinkType, MediaType
 from music_assistant_models.errors import InvalidDataError, MediaNotFoundError
 from music_assistant_models.media_items import (
     Album,
@@ -14,17 +14,19 @@ from music_assistant_models.media_items import (
     AudioFormat,
     ItemMapping,
     MediaItemImage,
+    MediaItemLink,
     MediaItemMetadata,
     Playlist,
     Podcast,
     PodcastEpisode,
     ProviderMapping,
+    Radio,
     Track,
 )
 
-from music_assistant.constants import UNKNOWN_ARTIST
+from music_assistant.constants import DEFAULT_AUDIOBOOK_PODCAST_GENRE, UNKNOWN_ARTIST
 from music_assistant.helpers.tags import clean_mbid
-from music_assistant.helpers.util import parse_title_and_version
+from music_assistant.helpers.util import infer_album_type, parse_title_and_version
 
 if TYPE_CHECKING:
     from libopensonic.media import AlbumID3 as SonicAlbum
@@ -32,6 +34,7 @@ if TYPE_CHECKING:
     from libopensonic.media import ArtistID3 as SonicArtist
     from libopensonic.media import ArtistInfo2 as SonicArtistInfo
     from libopensonic.media import Child as SonicSong
+    from libopensonic.media import InternetRadioStation as SonicRadio
     from libopensonic.media import Playlist as SonicPlaylist
     from libopensonic.media import PodcastChannel as SonicPodcast
     from libopensonic.media import PodcastEpisode as SonicEpisode
@@ -66,7 +69,7 @@ def get_item_mapping(instance_id: str, media_type: MediaType, key: str, name: st
     )
 
 
-def parse_track(  # noqa: PLR0915
+def parse_track(  # noqa: C901, PLR0912, PLR0915
     logger: logging.Logger,
     instance_id: str,
     sonic_song: SonicSong,
@@ -88,6 +91,16 @@ def parse_track(  # noqa: PLR0915
             )
 
     metadata: MediaItemMetadata = MediaItemMetadata()
+
+    if sonic_song.cover_art:
+        metadata.add_image(
+            MediaItemImage(
+                type=ImageType.THUMB,
+                path=sonic_song.cover_art,
+                provider=instance_id,
+                remotely_accessible=False,
+            )
+        )
 
     if lyrics:
         ly, synced = lyrics
@@ -133,7 +146,7 @@ def parse_track(  # noqa: PLR0915
         album=album,
         duration=sonic_song.duration or 0,
         disc_number=sonic_song.disc_number or 0,
-        favorite=bool(sonic_song.starred),
+        favorite=True if sonic_song.starred else None,
         metadata=metadata,
         provider_mappings={
             ProviderMapping(
@@ -244,35 +257,16 @@ def parse_artist(
             )
         )
 
-    if sonic_artist.artist_image_url:
-        metadata.add_image(
-            MediaItemImage(
-                type=ImageType.THUMB,
-                path=sonic_artist.artist_image_url,
-                provider=instance_id,
-                remotely_accessible=True,
-            )
-        )
-
     if sonic_info:
         if sonic_info.biography:
             metadata.description = sonic_info.biography
-        if sonic_info.small_image_url:
-            metadata.add_image(
-                MediaItemImage(
-                    type=ImageType.THUMB,
-                    path=sonic_info.small_image_url,
-                    provider=instance_id,
-                    remotely_accessible=True,
-                )
-            )
 
     artist = Artist(
         item_id=sonic_artist.id,
         name=sonic_artist.name,
         metadata=metadata,
         provider=SUBSONIC_DOMAIN,
-        favorite=bool(sonic_artist.starred),
+        favorite=True if sonic_artist.starred else None,
         provider_mappings={
             ProviderMapping(
                 item_id=sonic_artist.id,
@@ -287,6 +281,25 @@ def parse_artist(
         artist.mbid = mbid
 
     return artist
+
+
+def _map_release_type(sonic_album: SonicAlbum) -> AlbumType | None:
+    """Map a release_type into AlbumType."""
+    if sonic_album.release_types:
+        # Convert release_types to lowercase, for comparisons
+        lower_types = [item.lower() for item in sonic_album.release_types]
+
+        for ma_album_type in (
+            AlbumType.LIVE,
+            AlbumType.SOUNDTRACK,
+            AlbumType.COMPILATION,
+            AlbumType.EP,
+            AlbumType.SINGLE,
+            AlbumType.ALBUM,
+        ):
+            if ma_album_type.value in lower_types:
+                return ma_album_type
+    return None
 
 
 def parse_album(
@@ -309,15 +322,6 @@ def parse_album(
         )
 
     if sonic_info:
-        if sonic_info.small_image_url:
-            metadata.add_image(
-                MediaItemImage(
-                    type=ImageType.THUMB,
-                    path=sonic_info.small_image_url,
-                    remotely_accessible=True,
-                    provider=instance_id,
-                )
-            )
         if sonic_info.notes:
             metadata.description = sonic_info.notes
 
@@ -347,7 +351,7 @@ def parse_album(
         metadata=metadata,
         name=name,
         version=version,
-        favorite=bool(sonic_album.starred),
+        favorite=True if sonic_album.starred else None,
         provider_mappings={
             ProviderMapping(
                 item_id=sonic_album.id,
@@ -404,7 +408,56 @@ def parse_album(
                 )
             )
 
+    album_type = _map_release_type(sonic_album)
+
+    if (album_type is None or album_type == AlbumType.ALBUM) and (
+        sonic_album.is_compilation or sonic_album.artist == "Various Artists"
+    ):
+        album.album_type = AlbumType.COMPILATION
+    elif album_type is not None:
+        album.album_type = album_type
+
+    inferred_type = infer_album_type(name, version)
+    if inferred_type in (AlbumType.SOUNDTRACK, AlbumType.LIVE):
+        album.album_type = inferred_type
+
     return album
+
+
+def parse_radio(instance_id: str, sonic_station: SonicRadio) -> Radio:
+    """Parse an OpenSubsonic internet radio station into an MA Radio item."""
+    metadata: MediaItemMetadata = MediaItemMetadata()
+    if sonic_station.cover_art:
+        metadata.add_image(
+            MediaItemImage(
+                type=ImageType.THUMB,
+                path=sonic_station.cover_art,
+                provider=instance_id,
+                remotely_accessible=False,
+            )
+        )
+
+    radio = Radio(
+        item_id=sonic_station.id,
+        provider=instance_id,
+        name=sonic_station.name,
+        uri=sonic_station.stream_url,
+        metadata=metadata,
+        provider_mappings={
+            ProviderMapping(
+                item_id=sonic_station.id,
+                provider_domain=SUBSONIC_DOMAIN,
+                provider_instance=instance_id,
+            )
+        },
+    )
+
+    if sonic_station.home_page_url:
+        radio.metadata.links = {
+            MediaItemLink(type=LinkType.WEBSITE, url=sonic_station.home_page_url)
+        }
+
+    return radio
 
 
 def parse_playlist(instance_id: str, sonic_playlist: SonicPlaylist) -> Playlist:
@@ -422,6 +475,9 @@ def parse_playlist(instance_id: str, sonic_playlist: SonicPlaylist) -> Playlist:
             )
         },
     )
+
+    if sonic_playlist.comment:
+        playlist.metadata.description = sonic_playlist.comment
 
     if sonic_playlist.cover_art:
         playlist.metadata.add_image(
@@ -458,6 +514,7 @@ def parse_podcast(instance_id: str, sonic_podcast: SonicPodcast) -> Podcast:
     )
 
     podcast.metadata.description = sonic_podcast.description
+    podcast.metadata.genres = {DEFAULT_AUDIOBOOK_PODCAST_GENRE}
 
     if sonic_podcast.cover_art:
         podcast.metadata.add_image(
@@ -473,24 +530,25 @@ def parse_podcast(instance_id: str, sonic_podcast: SonicPodcast) -> Podcast:
 
 
 def parse_epsiode(
-    instance_id: str, sonic_episode: SonicEpisode, sonic_channel: SonicPodcast
+    instance_id: str,
+    sonic_episode: SonicEpisode,
+    sonic_channel: SonicPodcast,
+    position: int = 0,
 ) -> PodcastEpisode:
-    """Parse an Open Subsonic Podcast Episode into an MA PodcastEpisode."""
+    """
+    Parse an Open Subsonic Podcast Episode into an MA PodcastEpisode.
+
+    :param position: The episode's listing position. Defaults to 0 (unknown).
+    """
     eid = f"{sonic_episode.channel_id}{EP_CHAN_SEP}{sonic_episode.id}"
-    pos = 1
     if not sonic_channel.episode:
         raise MediaNotFoundError(f"Podcast Channel '{sonic_channel.id}' missing episode list")
-
-    for ep in sonic_channel.episode:
-        if ep.id == sonic_episode.id:
-            break
-        pos += 1
 
     episode = PodcastEpisode(
         item_id=eid,
         provider=SUBSONIC_DOMAIN,
         name=sonic_episode.title,
-        position=pos,
+        position=position,
         podcast=parse_podcast(instance_id, sonic_channel),
         provider_mappings={
             ProviderMapping(

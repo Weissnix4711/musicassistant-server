@@ -25,7 +25,7 @@ from music_assistant_models.errors import (
 )
 
 from music_assistant.controllers.tasks.context import update_current_task_progress_text
-from music_assistant.helpers.tags import get_embedded_image
+from music_assistant.helpers.tags import AudioTags, async_parse_tags, get_embedded_image
 from music_assistant.models.setup_flow import SetupFlowError
 from music_assistant.providers.filesystem_local import LocalFileSystemProvider
 from music_assistant.providers.filesystem_local.constants import (
@@ -36,8 +36,9 @@ from music_assistant.providers.filesystem_local.constants import (
     PODCAST_EPISODE_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
     TRACK_EXTENSIONS,
+    WALK_EXTENSIONS,
 )
-from music_assistant.providers.filesystem_local.helpers import FileSystemItem
+from music_assistant.providers.filesystem_local.helpers import FileSystemItem, ScanErrors
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -49,8 +50,11 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.models.setup_flow import SetupSession
 
-# (id, name, is_dir, checksum, size) as returned by _api_list_children
-RawItem = tuple[str, str, bool, str, int | None]
+# (id, name, is_dir, checksum, size, metadata_token) as returned by _api_list_children.
+# metadata_token is an optional higher-precision token (e.g. a stronger hash a provider
+# also computes) used only to detect a metadata file (NFO/image) changing; it never
+# substitutes for checksum, which stays whatever it always was for imported media.
+RawItem = tuple[str, str, bool, str, int | None, str | None]
 
 # extensions the stream route will serve; playlists/cue/images are read
 # server-side and never fetched over HTTP, so audio is all it needs to proxy
@@ -58,8 +62,8 @@ AUDIO_STREAM_EXTENSIONS = TRACK_EXTENSIONS | AUDIOBOOK_EXTENSIONS | PODCAST_EPIS
 
 # config keys shared by the cloud filesystem providers, all collected by the setup flow
 CONF_CLIENT_ID = "client_id"
-CONF_CLIENT_SECRET = "client_secret"
-CONF_REFRESH_TOKEN = "refresh_token"
+CONF_CLIENT_SECRET = "client_secret"  # noqa: S105 - config key
+CONF_REFRESH_TOKEN = "refresh_token"  # noqa: S105 - config key
 CONF_FOLDER_ID = "folder_id"
 
 
@@ -81,7 +85,7 @@ async def run_cloud_setup(
     # a secure value is never echoed back into a flow step, so on reconfigure the user may
     # leave the client secret blank to reuse the previously stored one
     stored_secret = str(session.context.setup_data.get(CONF_CLIENT_SECRET) or "")
-    errors: dict[str, str] | None = None
+    errors: dict[str, str | SetupFlowError] | None = None
     while True:
         entries = [
             replace(entry, value=setup_data.get(entry.key, entry.value))
@@ -96,12 +100,12 @@ async def run_cloud_setup(
         stored_secret = client_secret
         try:
             if not client_secret:
-                raise SetupFlowError("A client secret is required", translation_key="required")
+                raise SetupFlowError("A client secret is required", translation_key="required")  # noqa: TRY301 - shown as form error
             setup_data[CONF_REFRESH_TOKEN] = await authorize(session, client_id, client_secret)
             await session.finish(setup_data)
             return
         except SetupFlowError as err:
-            errors = {"base": err.translation_key or str(err)}
+            errors = {"base": err}
 
 
 def read_setup_value(
@@ -168,7 +172,9 @@ class CloudFileSystemProvider(LocalFileSystemProvider):
         # the content type is collected by the setup flow (setup_data); the parent reads it
         # from the legacy config values, so re-resolve it setup-data-aware (read-through keeps
         # pre-flow installs working)
-        self.media_content_type = cast("str", self.get_setup_value(CONF_CONTENT_TYPE))
+        self.media_content_type = cast(
+            "str", self.get_setup_value(CONF_CONTENT_TYPE, CONF_ENTRY_CONTENT_TYPE.default_value)
+        )
         self.root_folder_id = root_folder_id
         self._unregister_stream_route: Callable[[], None] | None = None
         # per-folder listing cache: folder path -> {child name -> (cloud id, item)};
@@ -181,6 +187,7 @@ class CloudFileSystemProvider(LocalFileSystemProvider):
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle unload/close of the provider."""
+        await super().unload(is_removed)
         if self._unregister_stream_route is not None:
             self._unregister_stream_route()
 
@@ -211,6 +218,10 @@ class CloudFileSystemProvider(LocalFileSystemProvider):
                 return img_data
             raise MediaNotFoundError(f"No embedded image found: {path}")
         return await self._read_file(path)
+
+    async def open_local_file(self, path: str) -> int | None:
+        """Return None: the stream path of a cloud file is its URL, which ffmpeg opens itself."""
+        return None
 
     # ------------------------------------------------------------------
     # API hooks (implemented by the concrete cloud provider); hooks must
@@ -262,6 +273,17 @@ class CloudFileSystemProvider(LocalFileSystemProvider):
     # filesystem hooks (these are what the parent calls)
     # ------------------------------------------------------------------
 
+    async def _is_reachable(self) -> bool:
+        """Return whether the cloud storage can be read."""
+        # this provider has no local path to stat, so ask the API for the root listing;
+        # an outage (or expired credentials) surfaces as a raised error
+        await self._scandir("", use_cache=False)
+        return True
+
+    async def _unreachable_folders(self) -> list[str]:
+        """Return no folders: a cloud drive has no storage locations below its root."""
+        return []
+
     async def _scandir(self, path: str, use_cache: bool = True) -> list[FileSystemItem]:
         """
         List the children of a cloud folder.
@@ -304,12 +326,13 @@ class CloudFileSystemProvider(LocalFileSystemProvider):
         self,
         *,
         file_checksums: dict[str, str],
-        cue_file_checksums: dict[str, str],
+        cue_file_checksums: dict[str, set[str]],
         cur_filenames: set[str],
         items_to_process: list[tuple[FileSystemItem, str | None]],
         unchanged_cue_items: list[FileSystemItem],
         cue_stems: set[str],
-        root_scan_errors: list[OSError],
+        scan_errors: ScanErrors,
+        metadata_files: list[FileSystemItem],
     ) -> None:
         """Walk the cloud folder tree via the API and populate the sync buckets."""
         ignore_album_playlists = self.media_content_type == "music" and bool(
@@ -330,18 +353,20 @@ class CloudFileSystemProvider(LocalFileSystemProvider):
                 # picked up no matter how recently a folder was browsed
                 items = await self._scandir(path, use_cache=False)
             except ProviderUnavailableError as err:
-                # only a root-level failure aborts the sync; subfolder failures
-                # are logged and skipped, matching the local-filesystem walker
-                if is_root:
-                    root_scan_errors.append(OSError(str(err)))
-                else:
+                # a root-level failure aborts the sync right away, subfolder failures only
+                # once too many happen in a row, matching the local-filesystem walker
+                if not is_root:
                     self.logger.warning("Error scanning folder %s: %s", path, err)
+                scan_errors.record_dir_error(err, is_root=is_root, path=path)
                 return
+            scan_errors.record_dir_read()
             for item in items:
                 if item.is_dir:
                     await _walk(item.relative_path, is_root=False)
+                    if scan_errors.aborted:
+                        return
                     continue
-                if item.ext not in SUPPORTED_EXTENSIONS:
+                if item.ext not in WALK_EXTENSIONS:
                     continue
                 scanned[0] += 1
                 if scanned[0] % 500 == 0:
@@ -355,6 +380,7 @@ class CloudFileSystemProvider(LocalFileSystemProvider):
                     unchanged_cue_items=unchanged_cue_items,
                     cue_stems=cue_stems,
                     ignore_album_playlists=ignore_album_playlists,
+                    metadata_files=metadata_files,
                 )
 
         await _walk("", is_root=True)
@@ -366,6 +392,14 @@ class CloudFileSystemProvider(LocalFileSystemProvider):
             return await self._api_download_bytes(file_id)
         except ProviderUnavailableError as err:
             raise MediaNotFoundError(f"Unable to read cloud file {path}: {err}") from err
+
+    async def _parse_tags(self, file_item: FileSystemItem) -> AudioTags:
+        """Parse the tags of a cloud file from its stream URL."""
+        tags = await async_parse_tags(file_item.absolute_path, file_item.file_size)
+        # ffprobe reports the (url-encoded) stream URL as filename; the title/track/artist
+        # fallbacks parse the filename, so hand them the real cloud path instead
+        tags.filename = file_item.relative_path
+        return tags
 
     def _get_chapter_path(self, relative_path: str) -> str:
         """Return the streamable URL for an audiobook chapter file."""
@@ -470,7 +504,7 @@ class CloudFileSystemProvider(LocalFileSystemProvider):
 
     def _to_item(self, raw: RawItem, parent_path: str, name: str) -> FileSystemItem:
         """Convert a raw API listing entry to a FileSystemItem."""
-        _, _, is_dir, checksum, size = raw
+        _, _, is_dir, checksum, size, metadata_token = raw
         relative_path = f"{parent_path}/{name}" if parent_path else name
         return FileSystemItem(
             filename=name,
@@ -482,4 +516,5 @@ class CloudFileSystemProvider(LocalFileSystemProvider):
             is_dir=is_dir,
             checksum=checksum,
             file_size=size,
+            metadata_token=metadata_token,
         )

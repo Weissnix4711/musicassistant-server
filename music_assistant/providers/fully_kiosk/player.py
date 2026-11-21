@@ -21,18 +21,20 @@ from music_assistant_models.enums import (
 from music_assistant_models.errors import PlayerCommandFailed
 
 from music_assistant.constants import (
-    CONF_ENTRY_OUTPUT_CODEC_DEFAULT_MP3,
+    CONF_ENTRY_OUTPUT_CODEC_DEFAULT_AAC,
     CONF_PASSWORD,
     CONF_SSL_FINGERPRINT,
     CONF_USE_SSL,
     CONF_VERIFY_SSL,
 )
-from music_assistant.models.player import DeviceInfo, Player, PlayerMedia
+from music_assistant.models.player import DeviceInfo, PlayerMedia
+from music_assistant.models.player_protocol import PlayerProtocol
 from music_assistant.models.setup_flow import SetupFlowError
 
 if TYPE_CHECKING:
     from music_assistant.models.setup_flow import SetupSession
 
+    from .dashboard import FullyKioskDashboards
     from .provider import FullyKioskProvider
 
 AUDIOMANAGER_STREAM_MUSIC = 3
@@ -69,7 +71,7 @@ def _build_fingerprint(value: str) -> Fingerprint:
     return Fingerprint(digest)
 
 
-class FullyKioskPlayer(Player):
+class FullyKioskPlayer(PlayerProtocol):
     """FullyKiosk Player implementation."""
 
     _attr_poll_interval = 10
@@ -77,12 +79,12 @@ class FullyKioskPlayer(Player):
     def __init__(
         self,
         provider: FullyKioskProvider,
-        player_id: str,
+        protocol_id: str,
         host: str,
         port: int = DEFAULT_PORT,
     ) -> None:
         """Initialize the FullyKiosk Player."""
-        super().__init__(provider, player_id)
+        super().__init__(provider, protocol_id)
         self.host = host
         self.port = port
         self.fully_kiosk: FullyKiosk | None = None
@@ -123,7 +125,9 @@ class FullyKioskPlayer(Player):
                 required=False,
                 advanced=True,
             ),
-            CONF_ENTRY_OUTPUT_CODEC_DEFAULT_MP3,
+            # Fully Kiosk aborts a long lived MP3 stream after roughly 8m45s and re-requests
+            # the url, so radio and long queues never play through. AAC is not affected.
+            CONF_ENTRY_OUTPUT_CODEC_DEFAULT_AAC,
         ]
 
     async def on_config_updated(self) -> None:
@@ -134,6 +138,7 @@ class FullyKioskPlayer(Player):
             self._attr_needs_setup = True
             self._attr_setup_reason = "password_required"
             self._attr_available = False
+            self._dashboards.unregister(self.protocol_id)
             self.update_state()
             return
         await self._connect()
@@ -143,14 +148,14 @@ class FullyKioskPlayer(Player):
         entries = [
             ConfigEntry(key=CONF_PASSWORD, type=ConfigEntryType.SECURE_STRING, required=True)
         ]
-        errors: dict[str, str] | None = None
+        errors: dict[str, str | SetupFlowError] | None = None
         while True:
             values = await session.form(entries, step_id="user", errors=errors, last_step=True)
             try:
                 await session.finish({CONF_PASSWORD: str(values[CONF_PASSWORD])})
                 return
             except SetupFlowError as err:
-                errors = {"base": err.translation_key or str(err)}
+                errors = {"base": err}
 
     async def poll(self) -> None:
         """Poll player for state updates."""
@@ -169,6 +174,7 @@ class FullyKioskPlayer(Player):
             )
             self._attr_available = False
             self.fully_kiosk = None
+            self._dashboards.unregister(self.protocol_id)
             self.update_state()
             return
         self._sync_state()
@@ -199,13 +205,22 @@ class FullyKioskPlayer(Player):
         """Handle PLAY MEDIA on given player."""
         if self.fully_kiosk is None:
             raise PlayerCommandFailed("Fully Kiosk device is not connected.")
-        url = await self.mass.streams.resolve_stream_url(self.player_id, media)
+        url = await self.mass.streams.resolve_stream_url(self.protocol_id, media)
         await self.fully_kiosk.playSound(url, AUDIOMANAGER_STREAM_MUSIC)
         self._attr_current_media = media
         self._attr_elapsed_time = 0
         self._attr_elapsed_time_last_updated = time.time()
         self._attr_playback_state = PlaybackState.PLAYING
         self.update_state()
+
+    async def on_detach(self) -> None:
+        """Handle logic when the protocol is detached from its player."""
+        await super().on_detach()
+        self._dashboards.unregister(self.protocol_id)
+
+    async def on_remove(self) -> None:
+        """Take the device out of the hosts the provider is set up with."""
+        cast("FullyKioskProvider", self.provider).forget_host(self.host, self.port)
 
     async def _connect(self) -> None:
         """Establish a connection to the Fully Kiosk device."""
@@ -215,42 +230,17 @@ class FullyKioskPlayer(Player):
             self._attr_setup_reason = "password_required"
             self._attr_available = False
             self.fully_kiosk = None
+            self._dashboards.unregister(self.protocol_id)
             self.update_state()
             return
 
-        use_ssl = bool(self.config.get_value(CONF_USE_SSL))
-        fingerprint_value = self.config.get_value(CONF_SSL_FINGERPRINT)
-        fingerprint_raw = fingerprint_value.strip() if isinstance(fingerprint_value, str) else ""
-        if fingerprint_raw and not use_ssl:
-            self.logger.warning(
-                "Fully Kiosk %s: fingerprint validation requires HTTPS to be enabled",
-                self.host,
-            )
+        session_info = self._resolve_http_session()
+        if session_info is None:
             self._attr_available = False
+            self._dashboards.unregister(self.protocol_id)
             self.update_state()
             return
-
-        verify_ssl = bool(self.config.get_value(CONF_VERIFY_SSL)) if use_ssl else False
-        http_session: ClientSession | _FingerprintSessionWrapper
-        if use_ssl:
-            if fingerprint_raw:
-                try:
-                    fingerprint = _build_fingerprint(fingerprint_raw)
-                except ValueError as err:
-                    self.logger.warning(
-                        "Fully Kiosk %s: invalid TLS fingerprint configured: %s", self.host, err
-                    )
-                    self._attr_available = False
-                    self.update_state()
-                    return
-                http_session = _FingerprintSessionWrapper(self.mass.http_session, fingerprint)
-                verify_ssl = True
-            else:
-                http_session = (
-                    self.mass.http_session if verify_ssl else self.mass.http_session_no_ssl
-                )
-        else:
-            http_session = self.mass.http_session_no_ssl
+        http_session, use_ssl, verify_ssl = session_info
 
         client = FullyKiosk(
             http_session,
@@ -273,6 +263,7 @@ class FullyKioskPlayer(Player):
             )
             self.fully_kiosk = None
             self._attr_available = False
+            self._dashboards.unregister(self.protocol_id)
             self.update_state()
             return
 
@@ -288,7 +279,36 @@ class FullyKioskPlayer(Player):
         self._attr_setup_reason = None
         self._attr_available = True
         self._sync_state()
+        self._dashboards.register(self)
         self.update_state()
+
+    def _resolve_http_session(
+        self,
+    ) -> tuple[ClientSession | _FingerprintSessionWrapper, bool, bool] | None:
+        """Resolve (http_session, use_ssl, verify_ssl) from config, or None if misconfigured."""
+        use_ssl = bool(self.config.get_value(CONF_USE_SSL))
+        fingerprint_value = self.config.get_value(CONF_SSL_FINGERPRINT)
+        fingerprint_raw = fingerprint_value.strip() if isinstance(fingerprint_value, str) else ""
+        if fingerprint_raw and not use_ssl:
+            self.logger.warning(
+                "Fully Kiosk %s: fingerprint validation requires HTTPS to be enabled",
+                self.host,
+            )
+            return None
+        verify_ssl = bool(self.config.get_value(CONF_VERIFY_SSL)) if use_ssl else False
+        if not use_ssl:
+            return self.mass.http_session_no_ssl, use_ssl, verify_ssl
+        if fingerprint_raw:
+            try:
+                fingerprint = _build_fingerprint(fingerprint_raw)
+            except ValueError as err:
+                self.logger.warning(
+                    "Fully Kiosk %s: invalid TLS fingerprint configured: %s", self.host, err
+                )
+                return None
+            return _FingerprintSessionWrapper(self.mass.http_session, fingerprint), use_ssl, True
+        session = self.mass.http_session if verify_ssl else self.mass.http_session_no_ssl
+        return session, use_ssl, verify_ssl
 
     def _sync_state(self) -> None:
         """Refresh player attributes from the latest deviceInfo."""
@@ -303,3 +323,8 @@ class FullyKioskPlayer(Player):
                 break
         if not device_info.get("soundUrlPlaying"):
             self._attr_playback_state = PlaybackState.IDLE
+
+    @property
+    def _dashboards(self) -> FullyKioskDashboards:
+        """Return the owning provider's dashboard adapter."""
+        return cast("FullyKioskProvider", self.provider).dashboards

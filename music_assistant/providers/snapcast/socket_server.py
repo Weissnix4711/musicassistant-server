@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, Any
 from music_assistant_models.enums import EventType
 from music_assistant_models.media_items.metadata import IMAGE_PROXY_ID_RESOLVER
 
+from music_assistant.helpers.api import run_api_command
+
 if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
 
@@ -140,8 +142,8 @@ class SnapcastSocketServer:
                     await self._handle_message(message)
                 except json.JSONDecodeError as err:
                     self._logger.warning("Invalid JSON from control script: %s", err)
-                except Exception as err:
-                    self._logger.exception("Error handling control script message: %s", err)
+                except Exception:
+                    self._logger.exception("Error handling control script message")
         except asyncio.CancelledError:
             pass
         except ConnectionResetError:
@@ -171,7 +173,7 @@ class SnapcastSocketServer:
             result = await self._execute_command(command, args)
             await self._send_result(msg_id, result)
         except Exception as err:
-            self._logger.exception("Error executing command %s: %s", command, err)
+            self._logger.exception("Error executing command %s", command)
             await self._send_error(msg_id, str(err))
 
     async def _execute_command(self, command: str, args: dict[str, Any]) -> Any:
@@ -187,7 +189,7 @@ class SnapcastSocketServer:
             raise ValueError(f"Unknown command: {command}")
 
         # Execute the handler
-        result = handler.target(**args)
+        result = run_api_command(self.mass, handler, args)
         if inspect.iscoroutine(result):
             result = await result
         return result

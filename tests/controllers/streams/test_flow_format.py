@@ -324,6 +324,36 @@ async def test_select_pcm_format_uses_stereo_f32_for_radio_overlay() -> None:
 
 
 @pytest.mark.asyncio
+async def test_select_pcm_format_folds_surround_source_to_stereo() -> None:
+    """A surround source is narrowed to stereo, since no output format carries more."""
+    audio = _make_streams_audio()
+    player = _make_player(
+        supported=[(44100, 16), (48000, 24)],
+        flow_mode=FLOW_MODE_SAMPLE_RATE_SMART,
+    )
+    streamdetails = _make_streamdetails(sample_rate=48000, bit_depth=24, channels=6)
+
+    fmt = await audio.select_pcm_format(player, streamdetails, crossfade_enabled=False)
+
+    assert fmt.channels == 2
+
+
+@pytest.mark.asyncio
+async def test_select_pcm_format_keeps_mono_source_mono() -> None:
+    """A mono source is not widened when no processing stage needs a stereo pivot."""
+    audio = _make_streams_audio()
+    player = _make_player(
+        supported=[(44100, 16), (48000, 24)],
+        flow_mode=FLOW_MODE_SAMPLE_RATE_SMART,
+    )
+    streamdetails = _make_streamdetails(sample_rate=48000, bit_depth=24, channels=1)
+
+    fmt = await audio.select_pcm_format(player, streamdetails, crossfade_enabled=False)
+
+    assert fmt.channels == 1
+
+
+@pytest.mark.asyncio
 async def test_select_flow_pcm_format_uses_f32_when_volume_normalization_active() -> None:
     """Active volume normalization on the start track triggers F32 headroom."""
     audio = _make_streams_audio()
@@ -600,16 +630,16 @@ def test_needs_restart_returns_false_when_streamdetails_missing() -> None:
 
 
 def test_flow_restart_context_prefers_protocol_player() -> None:
-    """The given (protocol) player's config and rates win over the queue player's."""
+    """The given protocol's config and rates win over the protocol rendering for the queue."""
     audio = _make_streams_audio()
     protocol_player = _make_player(
         supported=[(44100, 16), (96000, 24)],
         flow_mode=FLOW_MODE_SAMPLE_RATE_BIT_PERFECT,
     )
-    # queue (wrapper) player without audio config entries: 44100-only fallback
-    wrapper_player = _make_player(supported=[(44100, 16)])
+    # the protocol the queue's player renders through now: 44100-only
+    rendering_protocol = _make_player(supported=[(44100, 16)])
     audio.mass.players.get_player = MagicMock(  # type: ignore[method-assign]
-        return_value=wrapper_player
+        return_value=MagicMock(resolve_output_protocol=MagicMock(return_value=rendering_protocol))
     )
 
     conf, rates = audio._flow_restart_context("queue-1", protocol_player)
@@ -619,14 +649,14 @@ def test_flow_restart_context_prefers_protocol_player() -> None:
     audio.mass.players.get_player.assert_not_called()
 
 
-def test_flow_restart_context_falls_back_to_queue_player() -> None:
-    """Without a protocol player, the queue's own player is used."""
+def test_flow_restart_context_falls_back_to_the_protocol_rendering_for_the_queue() -> None:
+    """Without a given protocol, the one the queue's player renders through is used."""
     audio = _make_streams_audio()
-    queue_player = _make_player(
+    rendering_protocol = _make_player(
         supported=[(48000, 16)], flow_mode=FLOW_MODE_SAMPLE_RATE_BIT_PERFECT
     )
     audio.mass.players.get_player = MagicMock(  # type: ignore[method-assign]
-        return_value=queue_player
+        return_value=MagicMock(resolve_output_protocol=MagicMock(return_value=rendering_protocol))
     )
 
     conf, rates = audio._flow_restart_context("queue-1", None)
@@ -636,18 +666,20 @@ def test_flow_restart_context_falls_back_to_queue_player() -> None:
     audio.mass.players.get_player.assert_called_once_with("queue-1")
 
 
-def test_flow_restart_context_without_any_player() -> None:
-    """When no player can be resolved, the raw queue config and empty rates are used."""
+def test_flow_restart_context_without_any_protocol() -> None:
+    """Without a protocol rendering for the queue, the smart default and no rates are used."""
     audio = _make_streams_audio()
     audio.mass.players.get_player = MagicMock(return_value=None)  # type: ignore[method-assign]
-    audio.mass.config.get_raw_player_config_value = MagicMock(  # type: ignore[method-assign]
-        return_value=FLOW_MODE_SAMPLE_RATE_SMART
+    # a protocol setting is never read under the id of a queue
+    audio.mass.config.get_protocol_value = MagicMock(  # type: ignore[method-assign]
+        return_value=FLOW_MODE_SAMPLE_RATE_BIT_PERFECT
     )
 
     conf, rates = audio._flow_restart_context("queue-1", None)
 
     assert conf == FLOW_MODE_SAMPLE_RATE_SMART
     assert rates == []
+    audio.mass.config.get_protocol_value.assert_not_called()
 
 
 # --- helpers ---
@@ -693,6 +725,9 @@ def _make_streamdetails(
     streamdetails.audio_format = AudioFormat(
         sample_rate=sample_rate, bit_depth=bit_depth, channels=channels
     )
+    # a real StreamDetails leaves this unset unless the provider handed over
+    # already-decoded audio, and a MagicMock attribute would read as one
+    streamdetails.decoded_audio_format = None
     streamdetails.volume_normalization_mode = volume_normalization_mode
     streamdetails.media_type = media_type
     return streamdetails

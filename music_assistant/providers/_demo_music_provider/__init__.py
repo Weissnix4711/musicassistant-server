@@ -67,7 +67,13 @@ from music_assistant_models.streamdetails import StreamDetails
 from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
-    from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
+    from music_assistant_models.config_entries import (
+        ConfigActionResult,
+        ConfigEntry,
+        ProviderConfig,
+    )
+    from music_assistant_models.enums import PlaybackState
+    from music_assistant_models.playback_progress_report import MediaItemPlaybackProgressReport
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
@@ -94,6 +100,9 @@ SUPPORTED_FEATURES = {
     # that your music provider supports or an empty set if none.
     # for example 'ProviderFeature.BROWSE' if you can browse the provider's items.
     # see the ProviderFeature enum for all available features
+    # the 'provides' of manifest.json lists the media types a user looks for the provider
+    # under, for discovery only, before the provider is loaded; these features decide what
+    # it does. leave out what depends on the config or account.
 }
 
 
@@ -143,13 +152,17 @@ class MyDemoMusicprovider(MusicProvider):
         """
         return ()
 
-    async def handle_config_action(self, action: str) -> tuple[ConfigEntry, ...]:
+    async def handle_config_action(
+        self, action: str
+    ) -> tuple[ConfigEntry, ...] | ConfigActionResult | None:
         """
         Handle a one-shot ACTION button press from the options page.
 
         Run the side effect for the pressed ``action`` (the ``action`` id of one of the
-        ``ConfigEntryType.ACTION`` entries returned by ``get_config_entries``), then
-        return the (possibly refreshed) config entries so the options page re-renders.
+        ``ConfigEntryType.ACTION`` entries returned by ``get_config_entries``) and return
+        None: the action is a one-off, with nothing to re-render. Raise (typically
+        ``ActionUnavailable``) to report that the action could not run. Return config
+        entries only when the options page must re-render with different entries.
         Delegate unknown actions to ``super()`` (which raises ``ActionUnavailable``).
 
         Remove this method entirely when your provider declares no ACTION entries.
@@ -192,7 +205,20 @@ class MyDemoMusicprovider(MusicProvider):
         # For streaming providers return True here but for local file based providers return False.
         return True
 
-    async def search(  # type: ignore[empty-body]
+    @property
+    def supported_media_types(self) -> set[MediaType]:
+        """
+        Return the media types this provider can serve.
+
+        Defaults to the media types the provider declares library support for.
+        Override for providers that can serve (search/stream) media types they
+        cannot list as library items, so they are eligible for search-based
+        lookups such as cross-provider matching and versions.
+        """
+        # OPTIONAL - the default (derived from the LIBRARY_* features) is usually correct.
+        return super().supported_media_types
+
+    async def search(
         self,
         search_query: str,
         media_types: list[MediaType],
@@ -211,6 +237,7 @@ class MyDemoMusicprovider(MusicProvider):
         # See the model for SearchResults for more information on what to return, but
         # in general you should return a list of MediaItems for each media type.
         # For radio, a simple search of the available channel names is acceptable
+        return SearchResults()
 
     async def get_library_artists(self) -> AsyncGenerator[Artist]:
         """Retrieve library artists from the provider."""
@@ -334,6 +361,8 @@ class MyDemoMusicprovider(MusicProvider):
         """Get a list of all albums for the given artist."""
         # Get a list of all albums for the given artist.
         # Mandatory only if you reported ARTIST_ALBUMS in the supported_features.
+        # NOTE: When the API pages through the discography, stop at ARTIST_ALBUMS_LIMIT
+        # releases (music_assistant.models.music_provider) to keep the request count bounded.
         # NOTE: Because this is often static data, it is advised to apply caching here
         # to avoid too many calls to the provider's API.
         # You can use the @use_cache decorator from music_assistant.controllers.cache
@@ -532,6 +561,19 @@ class MyDemoMusicprovider(MusicProvider):
         # stream_type is set to CUSTOM in the get_stream_details method.
         yield  # type: ignore[misc]
 
+    async def on_stream_started(
+        self,
+        streamdetails: StreamDetails,
+    ) -> None:
+        """
+        Handle callback when the first audio of given streamdetails reaches a player.
+
+        Called once per playback, so unlike get_stream_details never for a preload.
+        A playback that triggers this callback is followed by at least one on_streamed.
+        """
+        # This is an OPTIONAL callback that is called when an item starts playing.
+        # You can use this e.g. to report the start of playback to the music service.
+
     async def on_streamed(
         self,
         streamdetails: StreamDetails,
@@ -578,6 +620,27 @@ class MyDemoMusicprovider(MusicProvider):
         """
         # This is an OPTIONAL callback that is called when an item has been streamed.
         # You can use this e.g. for playback reporting or statistics.
+
+    async def on_playback_progress(
+        self,
+        report: MediaItemPlaybackProgressReport,
+        prov_item_id: str,
+        state: PlaybackState,
+    ) -> None:
+        """
+        Handle callback when the playback of an item this provider streamed progresses.
+
+        Called only on the provider instance that streamed the item, and only once a player
+        received audio of it: when it starts, pauses, resumes or stops, when the next item
+        starts and every 30s while it plays.
+
+        :param report: The playback progress report; ``player_id`` names the playing player.
+        :param prov_item_id: The provider-specific id of the streamed item.
+        :param state: PLAYING or PAUSED while the item is current, IDLE once it stopped,
+            ended or was skipped.
+        """
+        # This is an OPTIONAL callback for reporting playback back to the music service,
+        # e.g. the device and position the service shows as playing now.
 
     async def resolve_image(self, path: str) -> str | bytes:
         """

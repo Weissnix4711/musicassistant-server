@@ -6,11 +6,11 @@ import pytest
 from aiohttp.client_exceptions import ClientResponseError
 from aiohttp.client_reqrep import RequestInfo
 from multidict import CIMultiDict, CIMultiDictProxy
-from music_assistant_models.enums import MediaType
 from music_assistant_models.media_items import Artist
 from yarl import URL
 
 from music_assistant.providers.apple_music.recommendations import AppleMusicRecommendationManager
+from tests.common import use_real_create_task
 
 
 def _make_artist_obj(artist_id: str, name: str) -> dict[str, object]:
@@ -70,11 +70,12 @@ def manager(mock_api: MagicMock) -> AppleMusicRecommendationManager:
     provider = MagicMock()
     provider.instance_id = "apple_music_test"
     provider.domain = "apple_music"
-    provider._storefront = "us"
+    provider.storefront = "us"
     provider.logger = MagicMock()
     provider.mass.cache.get = AsyncMock(return_value=None)
     provider.mass.cache.get_with_freshness = AsyncMock(return_value=(None, False, False))
     provider.mass.cache.set = AsyncMock()
+    use_real_create_task(provider.mass)
     provider.api_client = mock_api
 
     return AppleMusicRecommendationManager(provider)
@@ -166,12 +167,12 @@ async def test_get_similar_tracks_returns_tracks(
     """get_similar_tracks returns one limited response from the Apple API."""
     track_ids = [str(index) for index in range(1, 9)]
     mock_api.post_data.return_value = {"data": [_make_track_obj(item_id) for item_id in track_ids]}
-    mock_api.get_ratings.return_value = dict.fromkeys(track_ids, False)
 
     result = await manager.get_similar_tracks("123", limit=7)
 
     mock_api.post_data.assert_awaited_once_with("me/stations/next-tracks/ra.123", include="artists")
-    mock_api.get_ratings.assert_awaited_once_with(track_ids[:7], MediaType.TRACK)
+    # the favorite state comes from the library sync, not from a ratings call per lookup
+    mock_api.get_ratings.assert_not_awaited()
     assert [track.item_id for track in result] == track_ids[:7]
 
 
